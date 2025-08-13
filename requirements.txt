@@ -1,0 +1,13 @@
+langgraph
+langgraph-cli
+langgraph-sdk
+langchain
+langchain-anthropic
+anthropic
+chromadb
+sentence-transformers
+rank-bm25
+requests
+beautifulsoup4
+tavily-python
+python-dotenv
