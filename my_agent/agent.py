@@ -51,7 +51,10 @@ SYSTEM = (
 
 
 
+# nach dieser Zeile ...
 _BASE_DIR = r"C:\Users\Fritz\Desktop\Python\sleepingbagREBEL_Infos\geschliffen"
+# ... sofort hinzufügen:
+_BASE_DIR = os.getenv("BASE_DIR", _BASE_DIR)  # Cloud: per ENV setzen, lokal: Windows-Pfad
 
 DateiAuswahl = Literal[
     "Compression Caps",
