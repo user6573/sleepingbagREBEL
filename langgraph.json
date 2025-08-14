@@ -1,5 +1,5 @@
 {
-  "dependencies": ["./my_agent"],
+  "dependencies": ["./my_agent", "-r requirements.txt"],
   "graphs": {
     "agent": "my_agent.agent:graph"
   }
