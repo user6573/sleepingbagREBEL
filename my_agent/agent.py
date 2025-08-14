@@ -5,8 +5,13 @@ from typing import Annotated, Literal
 from typing_extensions import TypedDict
 
 import os
-from dotenv import load_dotenv
-load_dotenv()
+# .env nur lokal laden; in der Cloud sind ENV-Variablen gesetzt
+try:
+    from dotenv import load_dotenv  # optional
+    load_dotenv()
+except Exception:
+    pass
+
 
 from langchain_core.messages import AnyMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
