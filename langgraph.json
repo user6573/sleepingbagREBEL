@@ -1,6 +1,6 @@
 {
-  "dependencies": ["./my_agent", "-r requirements.txt"],
-  "graphs": {
-    "agent": "my_agent.agent:graph"
-  }
+  "assistants": [
+    { "name": "agent", "python_path": "your_agent_module:graph" },
+    { "name": "outlook_autodraft", "python_path": "outlook_autodraft.graph:autodraft_graph" }
+  ]
 }
