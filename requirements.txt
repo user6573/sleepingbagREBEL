@@ -1,8 +1,0 @@
-langgraph>=0.2.37
-langgraph-sdk>=0.1.31
-langchain-core>=0.3.0
-langchain-anthropic>=0.2.0
-msal>=1.28.0
-requests>=2.32.0
-python-dotenv>=1.0.1
-beautifulsoup4>=4.12.3
