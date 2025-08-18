@@ -1,10 +1,10 @@
 from __future__ import annotations
-import os
-import datetime as dt
-from typing import TypedDict, List, Optional, Dict, Any
-
+import os, base64, json
+from typing import TypedDict, List, Dict, Any, Optional
 import requests
-from msal import ConfidentialClientApplication
+
+# MSAL (delegated / public client + device code flow)
+import msal
 
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
@@ -15,16 +15,28 @@ from langchain_anthropic import ChatAnthropic
 # =========================
 # ====== ENV & CONSTS =====
 # =========================
-TENANT_ID = os.environ["MS_TENANT_ID"]           # <-- HIER EINTRAGEN (oder als Secret setzen)
-CLIENT_ID = os.environ["MS_CLIENT_ID"]           # <-- HIER EINTRAGEN
-CLIENT_SECRET = os.environ["MS_CLIENT_SECRET"]   # <-- HIER EINTRAGEN
-SHARED_MAILBOX = os.environ["MS_SHARED_MAILBOX"] # z.B. "[email protected]"  <-- HIER EINTRAGEN
+TENANT_ID = os.environ["MS_TENANT_ID"]             # z.B. "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+CLIENT_ID = os.environ["MS_PUBLIC_CLIENT_ID"]      # App-Registrierung → App (client) ID, **ohne** Secret
+SHARED_MAILBOX = os.environ["MS_SHARED_MAILBOX"]   # z.B. "friends@zenbivy.eu"
+
+# Delegated Scopes (mit Shared-Mailbox Zugriff)
+SCOPES = [
+    "Mail.Read",
+    "Mail.ReadWrite",
+    "Mail.Read.Shared",
+    "Mail.ReadWrite.Shared",
+    "offline_access",
+    "email",
+    "openid",
+    "profile",
+]
+
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]  # <-- HIER EINTRAGEN
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
-# System-Prompt (aus deiner Beschreibung, leicht gestrafft)
 SYSTEM = (
     "Du bist sleepingbagREBEL, ein präziser, netter Mitarbeiter von Zenbivy. "
     "Zeige nicht, dass du eine KI bist. "
@@ -32,13 +44,8 @@ SYSTEM = (
     "Gib nur die Informationen, nach denen gefragt wurde. "
     "Weise dezent auf den Newsletter hin (https://zenbivy.eu – rechts unten). "
     "Falls du die Frage nicht beantworten kannst, sage das und verweise auf friends@zenbivy.eu. "
-    "Tool-Nutzung: "
-    "• Für Größen/Anleitungen/Zubehör: 'gear_guide'. "
-    "• Für Versand/Rückgabe/Rabatt: 'bedingungen'. "
-    "• Für Verfügbarkeiten: 'wieder_verfuegbar'. "
-    "• Nutze 'search_web' (Zenbivy-Domain) nur bei Bedarf. "
-    "• RAG nur als letztes Mittel (hier nicht aktiv). "
-    "Verwende keine Sternchen (*)."
+    "Tool-Nutzung: • gear_guide • bedingungen • wieder_verfuegbar • search_web (nur wenn nötig). "
+    "RAG nur als letztes Mittel. Keine Sternchen (*)."
 )
 
 # =========================
@@ -53,31 +60,23 @@ _SOURCES = {
 }
 
 def _http_get(url: str, timeout: int = 20) -> str:
-    resp = requests.get(url, timeout=timeout, headers={"User-Agent":"ZenbivyAgent/1.0"})
+    resp = requests.get(url, timeout=timeout, headers={"User-Agent": "ZenbivyAgent/1.0"})
     resp.raise_for_status()
     return resp.text
 
 @tool("bedingungen")
 def bedingungen(kategorie: str) -> str:
-    """
-    Shop-Bedingungen als kompakter Text.
-    Mögliche Kategorien: Rabattcode | Rückgabe- & Umtauschbedingungen | Versandbedingungen
-    """
-    k = kategorie.strip().lower()
+    k = (kategorie or "").strip().lower()
     if "rabatt" in k:
         return "Rabattcode erhältst du im Newsletter (https://zenbivy.eu)."
     if "rückgabe" in k or "umtausch" in k:
-        return "Rückgabe/Umtausch: 14 Tage ab Erhalt; Artikel unbenutzt. Details auf der Website."
+        return "Rückgabe/Umtausch: 14 Tage; unbenutzt. Details auf der Website."
     if "versand" in k:
-        return "Versand: EU-weit; Laufzeiten 2–7 Werktage. Genaues auf https://zenbivy.eu."
+        return "Versand: EU-weit; 2–7 Werktage. Genaues auf https://zenbivy.eu."
     return "Unbekannte Kategorie. Verfügbar: Rabattcode | Rückgabe- & Umtauschbedingungen | Versandbedingungen."
 
 @tool("gear_guide")
 def gear_guide(name: str) -> dict:
-    """
-    Lädt vordefinierte Zenbivy-Seiteninhalte grob. Verfügbar:
-    - Größentabelle, Gebrauchsanweisung, Accessory Guide, Kontakt
-    """
     if name not in _SOURCES:
         return {"error": f"'{name}' nicht verfügbar. Options: {', '.join(_SOURCES.keys())}"}
     url = _SOURCES[name]
@@ -85,10 +84,7 @@ def gear_guide(name: str) -> dict:
         html = _http_get(url)
     except Exception as e:
         return {"error": f"Fehler beim Laden: {e}", "url": url}
-    # Vereinfachte Extraktion (ohne Bilder), bewusst kurz gehalten
-    text = html
-    if len(text) > 5000:
-        text = text[:5000] + " …"
+    text = html[:5000] + (" …" if len(html) > 5000 else "")
     return {"source": name, "url": url, "text": text}
 
 from pathlib import Path
@@ -96,10 +92,6 @@ _DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).resolve().parents[2] / "da
 
 @tool("wieder_verfuegbar")
 def wieder_verfuegbar(datei: str) -> str:
-    """
-    Liest eine Textdatei aus dem data/-Ordner (z. B. 'Light Quilt -4°C.txt') und
-    gibt den gesamten Inhalt zurück (Termine/Verfügbarkeit).
-    """
     fname = f"{datei}.txt" if not datei.lower().endswith(".txt") else datei
     p = _DATA_DIR / fname
     if not p.exists():
@@ -111,40 +103,28 @@ def wieder_verfuegbar(datei: str) -> str:
 
 @tool("search_web")
 def search_web(query: str, restrict_to_zenbivy: bool = True) -> dict:
-    """
-    Platzhalter-Websuche (minimal). Für produktiv: Tavily verwenden.
-    Hier nur Rückgabe eines Links, damit das Tool prinzipiell funktioniert.
-    """
     base = "https://zenbivy.eu" if restrict_to_zenbivy else "https://duckduckgo.com/?q="
     return {"query": query, "note": "Demo-Suche", "url": base}
 
 TOOLS = [bedingungen, gear_guide, wieder_verfuegbar, search_web]
 
 # =========================
-# ========= LLM ===========
+# ========= LLM ==========='
 # =========================
-llm = ChatAnthropic(
-    model=ANTHROPIC_MODEL,
-    api_key=ANTHROPIC_API_KEY,
-    temperature=0.2,
-    max_tokens=2000,
-)
+llm = ChatAnthropic(model=ANTHROPIC_MODEL, api_key=ANTHROPIC_API_KEY, temperature=0.2, max_tokens=2000)
 llm_with_tools = llm.bind_tools(TOOLS)
 _TOOL_MAP = {t.name: t for t in TOOLS}
 
 def run_agent_with_tools(user_text: str) -> str:
-    """Einmalige Tool-Schleife: LLM aufrufen, evtl. Tools ausführen, finalen Text zurückgeben."""
     msgs: List[Any] = [SystemMessage(content=SYSTEM), HumanMessage(content=user_text)]
-    for _ in range(4):  # bis zu 4 Tool-Runden
+    for _ in range(4):
         ai: AIMessage = llm_with_tools.invoke(msgs, config=RunnableConfig())
         msgs.append(ai)
         tool_calls = getattr(ai, "tool_calls", None) or []
         if not tool_calls:
             return ai.content or ""
         for call in tool_calls:
-            name = call.get("name")
-            args = call.get("args") or {}
-            tool = _TOOL_MAP.get(name)
+            name = call.get("name"); args = call.get("args") or {}; tool = _TOOL_MAP.get(name)
             if not tool:
                 msgs.append(ToolMessage(content=f"[FEHLER] Tool '{name}' nicht gefunden.", name=name, tool_call_id=call.get("id")))
                 continue
@@ -153,140 +133,163 @@ def run_agent_with_tools(user_text: str) -> str:
             except Exception as e:
                 res = {"error": str(e)}
             msgs.append(ToolMessage(content=str(res), name=name, tool_call_id=call.get("id")))
-    # Falls keine toolfreien Antworten kamen:
     return "Ich konnte die Anfrage nicht abschließen. Bitte schreibe an friends@zenbivy.eu."
 
 # =========================
-# ==== MS GRAPH CLIENT ====
+# === DELEGATED AUTH ====
 # =========================
-class GraphClient:
-    def __init__(self):
-        self.app = ConfidentialClientApplication(
-            CLIENT_ID, authority=f"https://login.microsoftonline.com/{TENANT_ID}",
-            client_credential=CLIENT_SECRET
+
+def _load_cache_from_state(b64: Optional[str]) -> msal.SerializableTokenCache:
+    cache = msal.SerializableTokenCache()
+    if b64:
+        try:
+            cache.deserialize(base64.b64decode(b64).decode("utf-8"))
+        except Exception:
+            pass
+    return cache
+
+
+def _dump_cache_to_b64(cache: msal.SerializableTokenCache) -> Optional[str]:
+    if cache.has_state_changed:
+        try:
+            raw = cache.serialize()
+            return base64.b64encode(raw.encode("utf-8")).decode("ascii")
+        except Exception:
+            return None
+    return None
+
+
+def _acquire_token(cache: msal.SerializableTokenCache) -> Dict[str, Any]:
+    app = msal.PublicClientApplication(client_id=CLIENT_ID, authority=AUTHORITY, token_cache=cache)
+    accounts = app.get_accounts()
+    result = None
+    if accounts:
+        result = app.acquire_token_silent(SCOPES, account=accounts[0])
+    if not result:
+        # Kein interaktiver Flow im Cron. Hinweis zurückgeben.
+        raise RuntimeError(
+            "Kein gültiges Delegated-Token im Cache. Bitte Device-Code-Login ausführen und Cache setzen (siehe scripts/authorize_device.py & scripts/seed_cache.py)."
         )
+    if "access_token" not in result:
+        raise RuntimeError(f"Tokenfehler: {result.get('error_description')}")
+    return result
 
-    def token(self) -> str:
-        res = self.app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
-        if "access_token" not in res:
-            raise RuntimeError(f"Tokenfehler: {res.get('error_description')}")
-        return res["access_token"]
-
-    def list_new_messages(self, since_iso: Optional[str], max_count: int = 10) -> List[Dict[str, Any]]:
-        """
-        Holt neue Mails aus Inbox des Shared Mailbox.
-        Wenn since_iso gesetzt ist, filtert nach receivedDateTime > since_iso.
-        """
-        at = self.token()
-        headers = {"Authorization": f"Bearer {at}"}
-        # Filter zusammenbauen
-        params = {
-            "$top": str(max_count),
-            "$select": "id,subject,receivedDateTime,from,bodyPreview,conversationId",
-            "$orderby": "receivedDateTime desc",
-        }
-        if since_iso:
-            params["$filter"] = f"receivedDateTime gt {since_iso}"
-        url = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/mailFolders/Inbox/messages"
-        r = requests.get(url, headers=headers, params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        return data.get("value", [])
-
-    def get_message_body(self, msg_id: str) -> str:
-        at = self.token()
-        headers = {"Authorization": f"Bearer {at}"}
-        url = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{msg_id}?$select=body"
-        r = requests.get(url, headers=headers, timeout=20)
-        r.raise_for_status()
-        body = r.json().get("body", {})
-        return body.get("content", "") or ""
-
-    def create_reply_draft(self, original_id: str, html_body: str) -> str:
-        """
-        Erzeugt einen Antwort-ENTWURF zu einer bestehenden Nachricht.
-        Gibt die Draft-ID zurück. NICHT senden.
-        """
-        at = self.token()
-        headers = {"Authorization": f"Bearer {at}", "Content-Type": "application/json"}
-
-        # 1) Reply-Entwurf anlegen
-        url_create = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}/createReply"
-        r = requests.post(url_create, headers=headers, timeout=20)
-        r.raise_for_status()
-        draft = r.json()
-        draft_id = draft["id"]
-
-        # 2) Body setzen (HTML)
-        url_patch = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{draft_id}"
-        patch = {"body": {"contentType": "HTML", "content": html_body}}
-        r2 = requests.patch(url_patch, headers=headers, json=patch, timeout=20)
-        r2.raise_for_status()
-        return draft_id
 
 # =========================
 # ====== GRAPH STATE ======
 # =========================
 class AppState(TypedDict, total=False):
-    # für LangGraph
     messages: List[Any]
-    # eigene Felder
+    msal_cache_b64: Optional[str]
     last_seen_iso: Optional[str]
     new_emails: List[Dict[str, Any]]
     drafted_count: int
     drafted_subjects: List[str]
 
+
+def _graph_get(url: str, token: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params or {}, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def _graph_post(url: str, token: str, json_body: Dict[str, Any]) -> Dict[str, Any]:
+    r = requests.post(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=json_body, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def _graph_patch(url: str, token: str, json_body: Dict[str, Any]) -> None:
+    r = requests.patch(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=json_body, timeout=20)
+    r.raise_for_status()
+
+
 def node_fetch_new_emails(state: AppState) -> AppState:
-    client = GraphClient()
+    cache = _load_cache_from_state(state.get("msal_cache_b64"))
+    token_res = _acquire_token(cache)
+    # Cache-Update zurück in State schreiben (Refresh)
+    cache_b64 = _dump_cache_to_b64(cache)
+
+    at = token_res["access_token"]
+    params = {"$top": "10", "$select": "id,subject,receivedDateTime,from,bodyPreview", "$orderby": "receivedDateTime desc"}
     since = state.get("last_seen_iso")
-    msgs = client.list_new_messages(since_iso=since, max_count=10)
-    # Max timestamp merken
+    if since:
+        params["$filter"] = f"receivedDateTime gt {since}"
+
+    url = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/mailFolders/Inbox/messages"
+    data = _graph_get(url, at, params=params)
+    msgs = data.get("value", [])
+
+    # max timestamp ermitteln
     max_dt = since
     for m in msgs:
         rcv = m.get("receivedDateTime")
         if rcv and (max_dt is None or rcv > max_dt):
             max_dt = rcv
-    out: AppState = {
-        "new_emails": msgs,
-        "last_seen_iso": max_dt or since,
-    }
+
+    out: AppState = {"new_emails": msgs, "last_seen_iso": max_dt or since}
+    if cache_b64:
+        out["msal_cache_b64"] = cache_b64
     return out
 
+
+def _get_msg_html(token: str, msg_id: str) -> str:
+    url = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{msg_id}?$select=body"
+    data = _graph_get(url, token)
+    body = data.get("body", {})
+    return body.get("content", "") or ""
+
+
+def _create_reply_draft(token: str, original_id: str, html_body: str) -> str:
+    # 1) Draft erzeugen
+    d1 = _graph_post(f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}/createReply", token, {})
+    draft_id = d1["id"]
+    # 2) Body patchen
+    _graph_patch(f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{draft_id}", token, {"body": {"contentType": "HTML", "content": html_body}})
+    return draft_id
+
+
 def node_generate_drafts(state: AppState) -> AppState:
-    client = GraphClient()
+    cache = _load_cache_from_state(state.get("msal_cache_b64"))
+    token_res = _acquire_token(cache)
+    cache_b64 = _dump_cache_to_b64(cache)
+    at = token_res["access_token"]
+
     drafted = 0
     subjects: List[str] = []
     for m in state.get("new_emails", []):
         msg_id = m["id"]
         subject = m.get("subject") or "(ohne Betreff)"
-        # Volltext nachladen:
-        body_html = client.get_message_body(msg_id)
         preview = (m.get("bodyPreview") or "").strip()
-        sender = (m.get("from", {}) or {}).get("emailAddress", {}).get("address", "")
-        # Prompt für die Antwort
+        sender = ((m.get("from") or {}).get("emailAddress") or {}).get("address", "")
+
+        full_html = _get_msg_html(at, msg_id)
         user_text = (
             f"Beantworte diese Kundenmail höflich und hilfreich. "
             f"Absender: {sender}\n"
             f"Betreff: {subject}\n"
             f"Mail (Auszug): {preview}\n"
-            f"Mail (HTML-Volltext folgt):\n{body_html}\n"
+            f"Mail (HTML-Volltext folgt):\n{full_html}\n"
             f"Erstelle bitte eine kurze, konkrete Antwort als HTML (ohne Signatur)."
         )
-        reply_html = run_agent_with_tools(user_text)
-        # Entwurf erzeugen
+        reply_html = run_agent_with_tools(user_text) or "<p>Vielen Dank für Ihre Nachricht.</p>"
         try:
-            draft_id = client.create_reply_draft(original_id=msg_id, html_body=reply_html)
+            _create_reply_draft(at, msg_id, reply_html)
             drafted += 1
             subjects.append(subject)
         except Exception as e:
             subjects.append(f"{subject} [Draft-Fehler: {e}]")
-    return {"drafted_count": drafted, "drafted_subjects": subjects}
+
+    out: AppState = {"drafted_count": drafted, "drafted_subjects": subjects}
+    if cache_b64:
+        out["msal_cache_b64"] = cache_b64
+    return out
+
 
 def node_summarize(state: AppState) -> AppState:
     drafted = state.get("drafted_count", 0)
     subjects = state.get("drafted_subjects", [])
     text = f"Erstellte Entwürfe: {drafted}\n" + "\n".join(f"- {s}" for s in subjects)
-    # Eine Abschlussnachricht in den State schreiben (optional nützlich fürs Studio)
     return {"messages": [AIMessage(content=text)]}
 
 # Graph bauen
