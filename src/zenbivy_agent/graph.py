@@ -1,7 +1,9 @@
+# graph.py
 from __future__ import annotations
 import os
 import datetime as dt
 from typing import TypedDict, List, Optional, Dict, Any
+from pathlib import Path
 
 import requests
 from msal import ConfidentialClientApplication
@@ -15,36 +17,29 @@ from langchain_anthropic import ChatAnthropic
 # =========================
 # ====== ENV & CONSTS =====
 # =========================
-TENANT_ID = os.environ["MS_TENANT_ID"]           # <-- HIER EINTRAGEN (oder als Secret setzen)
-CLIENT_ID = os.environ["MS_CLIENT_ID"]           # <-- HIER EINTRAGEN
-CLIENT_SECRET = os.environ["MS_CLIENT_SECRET"]   # <-- HIER EINTRAGEN
-SHARED_MAILBOX = os.environ["MS_SHARED_MAILBOX"] # z.B. "[email protected]"  <-- HIER EINTRAGEN
+TENANT_ID = os.environ["MS_TENANT_ID"]           # Azure AD Tenant ID
+CLIENT_ID = os.environ["MS_CLIENT_ID"]           # App (client) ID
+CLIENT_SECRET = os.environ["MS_CLIENT_SECRET"]   # Client secret
+SHARED_MAILBOX = os.environ["MS_SHARED_MAILBOX"] # z.B. "friends@zenbivy.eu"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]  # <-- HIER EINTRAGEN
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
-# System-Prompt (aus deiner Beschreibung, leicht gestrafft)
+# Wie weit zurück (in Minuten) E-Mails geholt werden sollen
+LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "5"))
+
+# System-Prompt (verkürzt + neutral für Draft-Erstellung)
 SYSTEM = (
     "Du bist sleepingbagREBEL, ein präziser, netter Mitarbeiter von Zenbivy. "
-    "Zeige nicht, dass du eine KI bist. "
-    "Antworte in der Sprache der Anfrage und kompakt. "
-    "Gib nur die Informationen, nach denen gefragt wurde. "
-    "Weise dezent auf den Newsletter hin (https://zenbivy.eu – rechts unten). "
-    "Falls du die Frage nicht beantworten kannst, sage das und verweise auf friends@zenbivy.eu. "
-    "Tool-Nutzung: "
-    "• Für Größen/Anleitungen/Zubehör: 'gear_guide'. "
-    "• Für Versand/Rückgabe/Rabatt: 'bedingungen'. "
-    "• Für Verfügbarkeiten: 'wieder_verfuegbar'. "
-    "• Nutze 'search_web' (Zenbivy-Domain) nur bei Bedarf. "
-    "• RAG nur als letztes Mittel (hier nicht aktiv). "
-    "Verwende keine Sternchen (*)."
+    "Antworte in der Sprache der E-Mail, kurz und konkret, ohne Floskeln, ohne Signatur. "
+    "Nutze ausschließlich den gelieferten E-Mail-Body-Inhalt. "
+    "Ignoriere Betreff, Absender, Header, Footer und zitierten Verlauf."
 )
 
 # =========================
 # ====== SIMPLE TOOLS =====
 # =========================
-
 _SOURCES = {
     "Größentabelle": "https://zenbivy.eu/pages/size-guide",
     "Gebrauchsanweisung": "https://zenbivy.eu/pages/owners-manual-support-document",
@@ -85,13 +80,11 @@ def gear_guide(name: str) -> dict:
         html = _http_get(url)
     except Exception as e:
         return {"error": f"Fehler beim Laden: {e}", "url": url}
-    # Vereinfachte Extraktion (ohne Bilder), bewusst kurz gehalten
     text = html
     if len(text) > 5000:
         text = text[:5000] + " …"
     return {"source": name, "url": url, "text": text}
 
-from pathlib import Path
 _DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).resolve().parents[2] / "data"))
 
 @tool("wieder_verfuegbar")
@@ -127,15 +120,17 @@ llm = ChatAnthropic(
     model=ANTHROPIC_MODEL,
     api_key=ANTHROPIC_API_KEY,
     temperature=0.2,
-    max_tokens=2000,
+    max_tokens=1200,
 )
 llm_with_tools = llm.bind_tools(TOOLS)
 _TOOL_MAP = {t.name: t for t in TOOLS}
 
 def run_agent_with_tools(user_text: str) -> str:
-    """Einmalige Tool-Schleife: LLM aufrufen, evtl. Tools ausführen, finalen Text zurückgeben."""
+    """
+    Einmalige Tool-Schleife: LLM aufrufen, evtl. Tools ausführen, finalen Text zurückgeben.
+    """
     msgs: List[Any] = [SystemMessage(content=SYSTEM), HumanMessage(content=user_text)]
-    for _ in range(4):  # bis zu 4 Tool-Runden
+    for _ in range(3):  # bis zu 3 Tool-Runden
         ai: AIMessage = llm_with_tools.invoke(msgs, config=RunnableConfig())
         msgs.append(ai)
         tool_calls = getattr(ai, "tool_calls", None) or []
@@ -153,7 +148,6 @@ def run_agent_with_tools(user_text: str) -> str:
             except Exception as e:
                 res = {"error": str(e)}
             msgs.append(ToolMessage(content=str(res), name=name, tool_call_id=call.get("id")))
-    # Falls keine toolfreien Antworten kamen:
     return "Ich konnte die Anfrage nicht abschließen. Bitte schreibe an friends@zenbivy.eu."
 
 # =========================
@@ -172,21 +166,19 @@ class GraphClient:
             raise RuntimeError(f"Tokenfehler: {res.get('error_description')}")
         return res["access_token"]
 
-    def list_new_messages(self, since_iso: Optional[str], max_count: int = 10) -> List[Dict[str, Any]]:
+    def list_messages_since(self, since_iso: str, max_count: int = 50) -> List[Dict[str, Any]]:
         """
-        Holt neue Mails aus Inbox des Shared Mailbox.
-        Wenn since_iso gesetzt ist, filtert nach receivedDateTime > since_iso.
+        Holt Mails aus der Inbox der Shared Mailbox mit Filter receivedDateTime >= since_iso.
+        since_iso muss z.B. '2025-08-20T09:10:00Z' sein (UTC).
         """
         at = self.token()
         headers = {"Authorization": f"Bearer {at}"}
-        # Filter zusammenbauen
         params = {
             "$top": str(max_count),
-            "$select": "id,subject,receivedDateTime,from,bodyPreview,conversationId",
+            "$select": "id,receivedDateTime",
             "$orderby": "receivedDateTime desc",
+            "$filter": f"receivedDateTime ge {since_iso}",
         }
-        if since_iso:
-            params["$filter"] = f"receivedDateTime gt {since_iso}"
         url = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/mailFolders/Inbox/messages"
         r = requests.get(url, headers=headers, params=params, timeout=20)
         r.raise_for_status()
@@ -194,6 +186,9 @@ class GraphClient:
         return data.get("value", [])
 
     def get_message_body(self, msg_id: str) -> str:
+        """
+        Liefert den RAW-Body (häufig HTML) der E-Mail.
+        """
         at = self.token()
         headers = {"Authorization": f"Bearer {at}"}
         url = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{msg_id}?$select=body"
@@ -225,79 +220,101 @@ class GraphClient:
         return draft_id
 
 # =========================
+# ======= HELPERS =========
+# =========================
+def utc_iso_now_minus_minutes(minutes: int) -> str:
+    """
+    Gibt eine UTC-ISO8601 Zeit mit Z-Suffix zurück, z.B. '2025-08-20T09:10:00Z'
+    """
+    return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+# =========================
 # ====== GRAPH STATE ======
 # =========================
 class AppState(TypedDict, total=False):
     # für LangGraph
     messages: List[Any]
     # eigene Felder
-    last_seen_iso: Optional[str]
+    lookback_iso: str
     new_emails: List[Dict[str, Any]]
     drafted_count: int
-    drafted_subjects: List[str]
+    drafted_ids: List[str]
 
-def node_fetch_new_emails(state: AppState) -> AppState:
+def node_fetch_recent_emails(state: AppState) -> AppState:
+    """
+    Holt E-Mails der letzten LOOKBACK_MINUTES Minuten (nur IDs und Timestamps).
+    """
     client = GraphClient()
-    since = state.get("last_seen_iso")
-    msgs = client.list_new_messages(since_iso=since, max_count=10)
-    # Max timestamp merken
-    max_dt = since
-    for m in msgs:
-        rcv = m.get("receivedDateTime")
-        if rcv and (max_dt is None or rcv > max_dt):
-            max_dt = rcv
-    out: AppState = {
+    since_iso = utc_iso_now_minus_minutes(LOOKBACK_MINUTES)
+    msgs = client.list_messages_since(since_iso=since_iso, max_count=50)
+    return {
+        "lookback_iso": since_iso,
         "new_emails": msgs,
-        "last_seen_iso": max_dt or since,
     }
-    return out
 
-def node_generate_drafts(state: AppState) -> AppState:
+def node_generate_drafts_body_only(state: AppState) -> AppState:
+    """
+    Lädt für jede Nachricht den tatsächlichen Body (RAW, zumeist HTML) und
+    erstellt auf Basis *ausschließlich dieses Bodys* eine kurze HTML-Antwort.
+    Speichert die Antwort als Draft.
+    """
     client = GraphClient()
     drafted = 0
-    subjects: List[str] = []
+    draft_ids: List[str] = []
+
     for m in state.get("new_emails", []):
         msg_id = m["id"]
-        subject = m.get("subject") or "(ohne Betreff)"
-        # Volltext nachladen:
+
+        # 1) Original-Body (RAW; häufig HTML) holen
         body_html = client.get_message_body(msg_id)
-        preview = (m.get("bodyPreview") or "").strip()
-        sender = (m.get("from", {}) or {}).get("emailAddress", {}).get("address", "")
-        # Prompt für die Antwort
+
+        # 2) LLM nur mit E-Mail-Body füttern
         user_text = (
-            f"Beantworte diese Kundenmail höflich und hilfreich. "
-            f"Absender: {sender}\n"
-            f"Betreff: {subject}\n"
-            f"Mail (Auszug): {preview}\n"
-            f"Mail (HTML-Volltext folgt):\n{body_html}\n"
-            f"Erstelle bitte eine kurze, konkrete Antwort als HTML (ohne Signatur)."
+            "Erstelle eine höfliche, hilfreiche und konkrete Antwort als HTML (ohne Signatur, "
+            "ohne Firmenfußzeile). Antworte ausschließlich basierend auf folgendem E-Mail-Body. "
+            "Wenn unklar, bitte kurz und präzise nachfragen. "
+            "Antworte in der Sprache des folgenden Inhalts.\n\n"
+            "EMAIL_BODY_HTML_START\n"
+            f"{body_html}\n"
+            "EMAIL_BODY_HTML_END"
         )
-        reply_html = run_agent_with_tools(user_text)
-        # Entwurf erzeugen
+
+        reply_html = run_agent_with_tools(user_text).strip()
+
+        # 3) Draft im Shared Mailbox erstellen
         try:
             draft_id = client.create_reply_draft(original_id=msg_id, html_body=reply_html)
             drafted += 1
-            subjects.append(subject)
+            draft_ids.append(draft_id)
         except Exception as e:
-            subjects.append(f"{subject} [Draft-Fehler: {e}]")
-    return {"drafted_count": drafted, "drafted_subjects": subjects}
+            # Draft-Fehler protokollieren – keine Exception nach oben werfen
+            draft_ids.append(f"[Draft-Fehler für {msg_id}: {e}]")
+
+    return {"drafted_count": drafted, "drafted_ids": draft_ids}
 
 def node_summarize(state: AppState) -> AppState:
     drafted = state.get("drafted_count", 0)
-    subjects = state.get("drafted_subjects", [])
-    text = f"Erstellte Entwürfe: {drafted}\n" + "\n".join(f"- {s}" for s in subjects)
-    # Eine Abschlussnachricht in den State schreiben (optional nützlich fürs Studio)
+    ids = state.get("drafted_ids", [])
+    lookback = state.get("lookback_iso", "")
+    summary_lines = [
+        f"Zeitraum: seit {lookback}",
+        f"Erstellte Entwürfe: {drafted}",
+    ]
+    if ids:
+        summary_lines.append("Draft-IDs / Meldungen:")
+        summary_lines.extend(f"- {x}" for x in ids)
+    text = "\n".join(summary_lines)
     return {"messages": [AIMessage(content=text)]}
 
 # Graph bauen
 builder = StateGraph(AppState)
-builder.add_node("fetch_new_emails", node_fetch_new_emails)
-builder.add_node("generate_drafts", node_generate_drafts)
+builder.add_node("fetch_recent_emails", node_fetch_recent_emails)
+builder.add_node("generate_drafts_body_only", node_generate_drafts_body_only)
 builder.add_node("summarize", node_summarize)
 
-builder.add_edge(START, "fetch_new_emails")
-builder.add_edge("fetch_new_emails", "generate_drafts")
-builder.add_edge("generate_drafts", "summarize")
+builder.add_edge(START, "fetch_recent_emails")
+builder.add_edge("fetch_recent_emails", "generate_drafts_body_only")
+builder.add_edge("generate_drafts_body_only", "summarize")
 builder.add_edge("summarize", END)
 
 graph = builder.compile()
