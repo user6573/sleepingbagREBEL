@@ -3,7 +3,8 @@
     "./"
   ],
   "graphs": {
-    "zenbivy": "./src/zenbivy_agent/graph.py:graph"
+    "zenbivy": "./src/zenbivy_agent/graph.py:graph",
+    "sleepingbagREBEL-Website": "./src/zenbivy_agent/graph.py:graph_chat"
   },
   "env": "./.env",
   "python_version": "3.11"
