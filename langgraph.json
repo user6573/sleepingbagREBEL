@@ -1,7 +1,10 @@
 {
-  "dependencies": ["."],
-  "env": ".env",
+  "dependencies": [
+    "./"
+  ],
   "graphs": {
-    "auto_drafter": "./src/agent/graph.py:graph"
-  }
+    "zenbivy": "./src/zenbivy_agent/graph.py:graph"
+  },
+  "env": "./.env",
+  "python_version": "3.11"
 }
