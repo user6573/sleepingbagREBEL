@@ -122,7 +122,7 @@ llm = ChatAnthropic(
     model=ANTHROPIC_MODEL,
     api_key=ANTHROPIC_API_KEY,
     temperature=0.2,
-    max_tokens=50000,
+    max_tokens=8000,
 )
 llm_with_tools = llm.bind_tools(TOOLS)
 
@@ -357,4 +357,5 @@ graph_chat = builder_chat.compile()
 # =================================
 # Für bestehende Deployments kann 'graph' auf den Autodraft-Graph zeigen.
 graph = graph_autodraft
+
 
