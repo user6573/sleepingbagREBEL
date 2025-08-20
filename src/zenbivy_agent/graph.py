@@ -8,7 +8,8 @@ from pathlib import Path
 import requests
 from msal import ConfidentialClientApplication
 
-from langgraph.graph import StateGraph, START, END
+from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
@@ -29,12 +30,12 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 # Wie weit zurück (in Minuten) E-Mails geholt werden sollen
 LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "5"))
 
-# System-Prompt (verkürzt + neutral für Draft-Erstellung)
+# System-Prompt (neutral für Draft-Erstellung & Chat)
 SYSTEM = (
     "Du bist sleepingbagREBEL, ein präziser, netter Mitarbeiter von Zenbivy. "
-    "Antworte in der Sprache der E-Mail, kurz und konkret, ohne Floskeln, ohne Signatur. "
-    "Nutze ausschließlich den gelieferten E-Mail-Body-Inhalt. "
-    "Ignoriere Betreff, Absender, Header, Footer und zitierten Verlauf."
+    "Antworte in der Sprache der Eingabe, kurz und konkret, ohne Floskeln, ohne Signatur. "
+    "Nutze nur die gelieferten Informationen bzw. Tools. "
+    "Ignoriere E-Mail-Header/Signaturen/Zitate, wenn nicht relevant."
 )
 
 # =========================
@@ -112,6 +113,7 @@ def search_web(query: str, restrict_to_zenbivy: bool = True) -> dict:
     return {"query": query, "note": "Demo-Suche", "url": base}
 
 TOOLS = [bedingungen, gear_guide, wieder_verfuegbar, search_web]
+_TOOL_MAP = {t.name: t for t in TOOLS}
 
 # =========================
 # ========= LLM ===========
@@ -123,11 +125,10 @@ llm = ChatAnthropic(
     max_tokens=1200,
 )
 llm_with_tools = llm.bind_tools(TOOLS)
-_TOOL_MAP = {t.name: t for t in TOOLS}
 
 def run_agent_with_tools(user_text: str) -> str:
     """
-    Einmalige Tool-Schleife: LLM aufrufen, evtl. Tools ausführen, finalen Text zurückgeben.
+    Einmalige Tool-Schleife für einfache Prompts -> Textantwort.
     """
     msgs: List[Any] = [SystemMessage(content=SYSTEM), HumanMessage(content=user_text)]
     for _ in range(3):  # bis zu 3 Tool-Runden
@@ -229,7 +230,7 @@ def utc_iso_now_minus_minutes(minutes: int) -> str:
     return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 # =========================
-# ====== GRAPH STATE ======
+# ====== AUTODRAFT GRAPH ==
 # =========================
 class AppState(TypedDict, total=False):
     # für LangGraph
@@ -287,7 +288,6 @@ def node_generate_drafts_body_only(state: AppState) -> AppState:
             drafted += 1
             draft_ids.append(draft_id)
         except Exception as e:
-            # Draft-Fehler protokollieren – keine Exception nach oben werfen
             draft_ids.append(f"[Draft-Fehler für {msg_id}: {e}]")
 
     return {"drafted_count": drafted, "drafted_ids": draft_ids}
@@ -306,15 +306,54 @@ def node_summarize(state: AppState) -> AppState:
     text = "\n".join(summary_lines)
     return {"messages": [AIMessage(content=text)]}
 
-# Graph bauen
-builder = StateGraph(AppState)
-builder.add_node("fetch_recent_emails", node_fetch_recent_emails)
-builder.add_node("generate_drafts_body_only", node_generate_drafts_body_only)
-builder.add_node("summarize", node_summarize)
+# Graph bauen (Autodraft)
+builder_autodraft = StateGraph(AppState)
+builder_autodraft.add_node("fetch_recent_emails", node_fetch_recent_emails)
+builder_autodraft.add_node("generate_drafts_body_only", node_generate_drafts_body_only)
+builder_autodraft.add_node("summarize", node_summarize)
 
-builder.add_edge(START, "fetch_recent_emails")
-builder.add_edge("fetch_recent_emails", "generate_drafts_body_only")
-builder.add_edge("generate_drafts_body_only", "summarize")
-builder.add_edge("summarize", END)
+builder_autodraft.add_edge(START, "fetch_recent_emails")
+builder_autodraft.add_edge("fetch_recent_emails", "generate_drafts_body_only")
+builder_autodraft.add_edge("generate_drafts_body_only", "summarize")
+builder_autodraft.add_edge("summarize", END)
 
-graph = builder.compile()
+graph_autodraft = builder_autodraft.compile()
+
+# =================================
+# ====== CHAT GRAPH (CONVERSATION)
+# =================================
+def call_model(state: MessagesState) -> Dict[str, Any]:
+    """
+    Fügt den System-Prompt voran und ruft das Modell (mit Tools) auf.
+    """
+    msgs = [SystemMessage(content=SYSTEM)] + state["messages"]
+    ai = llm_with_tools.invoke(msgs, config=RunnableConfig())
+    return {"messages": [ai]}
+
+# Tool-Knoten für automatische Toolausführung
+tool_node = ToolNode(TOOLS)
+
+# Graph bauen (Chat)
+builder_chat = StateGraph(MessagesState)
+builder_chat.add_node("call_model", call_model)
+builder_chat.add_node("tools", tool_node)
+
+builder_chat.add_edge(START, "call_model")
+# Wenn das Modell Tools anfordert -> Tools ausführen, dann zurück zum Modell
+builder_chat.add_conditional_edges(
+    "call_model",
+    tools_condition,  # entscheidet anhand von tool_calls
+    {
+        "tools": "tools",
+        END: END,
+    },
+)
+builder_chat.add_edge("tools", "call_model")
+
+graph_chat = builder_chat.compile()
+
+# =================================
+# ===== Default-Export (optional) ==
+# =================================
+# Für bestehende Deployments kann 'graph' auf den Autodraft-Graph zeigen.
+graph = graph_autodraft
