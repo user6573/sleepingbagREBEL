@@ -1,4 +1,4 @@
-# graph.py — Overkill Email Drafts (Reply-Draft + Verlauf)
+# graph.py — Overkill Email Drafts
 from __future__ import annotations
 import os, time, random, re
 import datetime as dt
@@ -26,7 +26,7 @@ GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 # --- Modell/Token-Config (OVERKILL) ---
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-# Default: Sonnet 3.7 (großes Output-Limit) + 128k-Beta optional
+# Default: Sonnet 3.7 (größtes Output-Limit) + 128k-Beta aktiv
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-7-sonnet-latest")
 ANTHROPIC_MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", "90000"))  # groß, aber unter 128k
 ANTHROPIC_OUTPUT_128K = os.getenv("ANTHROPIC_OUTPUT_128K", "1") == "1"
@@ -140,12 +140,14 @@ llm = ChatAnthropic(
 )
 llm_with_tools = llm.bind_tools(TOOLS)
 
+
 def _is_retryable_error(exc: Exception) -> bool:
     s = str(exc).lower()
     return any(k in s for k in [
         "overloaded", "rate_limit", "timeout", "temporarily", "unavailable",
         "gateway", "service unavailable", "529", "429", "502", "503", "504"
     ])
+
 
 def _invoke_with_retry(_llm, msgs, attempts: int = 7, base: float = 0.6, cap: float = 30.0):
     for i in range(attempts):
@@ -156,6 +158,7 @@ def _invoke_with_retry(_llm, msgs, attempts: int = 7, base: float = 0.6, cap: fl
                 raise
             sleep_s = min(cap, base * (2 ** i)) + random.uniform(0, 0.6)
             time.sleep(sleep_s)
+
 
 def _try_invoke_with_fallback(msgs):
     try:
@@ -170,6 +173,7 @@ def _try_invoke_with_fallback(msgs):
             ).bind_tools(TOOLS)
             return _invoke_with_retry(alt_llm, msgs)
         raise
+
 
 def run_agent_with_tools(user_text: str) -> str:
     """
@@ -196,12 +200,14 @@ def run_agent_with_tools(user_text: str) -> str:
             msgs.append(ToolMessage(content=str(res), name=name, tool_call_id=call.get("id")))
     return "Ich konnte die Anfrage nicht abschließen. Bitte schreibe an friends@zenbivy.eu."
 
+
 # ==============
 # === QUALITY ===
 # ==============
-_SANITIZE_TAGS_RE = re.compile(r"<(script|style|iframe|link|meta|object|embed)[\\s\\S]*?>[\\s\\S]*?</\\\\1>", re.IGNORECASE)
-_ON_EVENT_ATTR_RE = re.compile(r"\\son[a-z]+=\\\"[^\\\"]*\\\"", re.IGNORECASE)
-_JS_URL_RE = re.compile(r"(javascript:)[^\\\"']*", re.IGNORECASE)
+_SANITIZE_TAGS_RE = re.compile(r"<(script|style|iframe|link|meta|object|embed)[\s\S]*?>[\s\S]*?</\\1>", re.IGNORECASE)
+_ON_EVENT_ATTR_RE = re.compile(r"\son[a-z]+=\"[^\"]*\"", re.IGNORECASE)
+_JS_URL_RE = re.compile(r"(javascript:)[^\"']*", re.IGNORECASE)
+
 
 def _sanitize_email_html(html: str) -> str:
     if not html:
@@ -215,11 +221,6 @@ def _sanitize_email_html(html: str) -> str:
     # Trim
     return html.strip()
 
-def _combine_reply_with_history(reply_html: str, orig_html: str) -> str:
-    orig = _sanitize_email_html(orig_html)
-    if not reply_html:
-        reply_html = ""
-    return reply_html + "\n<hr>\n<div class=\"quoted-original\">" + (orig or "") + "</div>"
 
 def _candidate_prompt(body_html: str, variant_id: int) -> str:
     return (
@@ -229,12 +230,13 @@ def _candidate_prompt(body_html: str, variant_id: int) -> str:
         "Wenn Informationen fehlen, stelle am Ende maximal 3 prägnante Rückfragen als <ul>. "
         "Achte auf: korrekte Sprache (automatisch erkennen), klare Struktur (<p>, <ul>, <ol>, <strong>), "
         "präzise Produkthinweise. Nutze Links auf Zenbivy-Seiten nur, wenn sie explizit im Tool 'gear_guide' vorkommen. "
-        "Gib ausschließlich den E-Mail-Body (HTML) zurück, keine Erklärungen.\\n\\n"
-        "EMAIL_BODY_HTML_START\\n"
-        f"{body_html}\\n"
-        "EMAIL_BODY_HTML_END\\n\\n"
+        "Gib ausschließlich den E-Mail-Body (HTML) zurück, keine Erklärungen.\n\n"
+        "EMAIL_BODY_HTML_START\n"
+        f"{body_html}\n"
+        "EMAIL_BODY_HTML_END\n\n"
         f"VARIANT: {variant_id}"
     )
+
 
 def _critique_prompt(candidates: List[str], body_html: str) -> str:
     rubric = (
@@ -242,10 +244,11 @@ def _critique_prompt(candidates: List[str], body_html: str) -> str:
         "(4) Ton/Markenstimme, (5) Sprachqualität. Korrigiere Mängel. Gib NUR das finale, verbessertes HTML zurück "
         "(ohne <html>/<head>/<body>), mit Abschluss ‘— sleepingbagREBEL’. Keine Kommentare/Erklärungen."
     )
-    joined = "\\n\\n".join([f"CANDIDATE_{i+1}_START\\n{c}\\nCANDIDATE_{i+1}_END" for i, c in enumerate(candidates)])
+    joined = "\n\n".join([f"CANDIDATE_{i+1}_START\n{c}\nCANDIDATE_{i+1}_END" for i, c in enumerate(candidates)])
     return (
-        f"{rubric}\\n\\nEMAIL_BODY_HTML_START\\n{body_html}\\nEMAIL_BODY_HTML_END\\n\\n{joined}"
+        f"{rubric}\n\nEMAIL_BODY_HTML_START\n{body_html}\nEMAIL_BODY_HTML_END\n\n{joined}"
     )
+
 
 def generate_overkill_reply(body_html: str) -> str:
     # 1) Kandidaten erstellen
@@ -265,6 +268,7 @@ def generate_overkill_reply(body_html: str) -> str:
 
     # 3) Sanitize
     return _sanitize_email_html(final_html)
+
 
 # =========================
 # ==== MS GRAPH CLIENT ====
@@ -306,43 +310,20 @@ class GraphClient:
         body = r.json().get("body", {})
         return body.get("content", "") or ""
 
-    def create_reply_draft(self, original_id: str, html_body: str, mode: str = "reply") -> str:
-        """
-        Erzeugt einen ENTWURF **als Antwort** auf eine bestehende Nachricht.
-        mode: "reply" (Standard) oder "reply_all".
-        Gibt die Draft-ID zurück. NICHT senden.
-        """
+    def create_reply_draft(self, original_id: str, html_body: str) -> str:
         at = self.token()
         headers = {"Authorization": f"Bearer {at}", "Content-Type": "application/json"}
 
-        # Original-Metadaten holen (für Fallbacks bei Empfängern)
-        meta_url = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}"
-        meta_sel = "$select=from,toRecipients,ccRecipients,subject"
-        r_meta = requests.get(f"{meta_url}?{meta_sel}", headers=headers, timeout=20)
-        r_meta.raise_for_status()
-        meta = r_meta.json()
-        orig_from = (meta.get("from") or {}).get("emailAddress")
-
-        # 1) Reply-Entwurf anlegen (reply oder reply_all)
-        if mode == "reply_all":
-            url_create = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}/createReplyAll"
-        else:
-            url_create = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}/createReply"
-
+        # 1) Reply-Entwurf anlegen
+        url_create = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}/createReply"
         r = requests.post(url_create, headers=headers, timeout=20)
         r.raise_for_status()
         draft = r.json()
         draft_id = draft["id"]
 
-        # 2) Body setzen (HTML) und – falls nötig – Empfänger absichern
-        patch: Dict[str, Any] = {"body": {"contentType": "HTML", "content": html_body}}
-
-        # Bei einfachem Reply sicherstellen, dass der Absender im To steht
-        if mode == "reply" and orig_from:
-            patch["toRecipients"] = [{"emailAddress": orig_from}]
-        # Bei reply_all NICHT überschreiben (Graph füllt To/Cc korrekt); nur Body patchen
-
+        # 2) Body setzen (HTML)
         url_patch = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{draft_id}"
+        patch = {"body": {"contentType": "HTML", "content": html_body}}
         r2 = requests.patch(url_patch, headers=headers, json=patch, timeout=20)
         r2.raise_for_status()
         return draft_id
@@ -350,6 +331,7 @@ class GraphClient:
 # =========================
 # ======= HELPERS =========
 # =========================
+
 def utc_iso_now_minus_minutes(minutes: int) -> str:
     return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -363,6 +345,7 @@ class AppState(TypedDict, total=False):
     drafted_count: int
     drafted_ids: List[str]
 
+
 def node_fetch_recent_emails(state: AppState) -> AppState:
     client = GraphClient()
     since_iso = utc_iso_now_minus_minutes(LOOKBACK_MINUTES)
@@ -371,6 +354,7 @@ def node_fetch_recent_emails(state: AppState) -> AppState:
         "lookback_iso": since_iso,
         "new_emails": msgs,
     }
+
 
 def node_generate_drafts_body_only(state: AppState) -> AppState:
     client = GraphClient()
@@ -383,16 +367,16 @@ def node_generate_drafts_body_only(state: AppState) -> AppState:
 
         # OVERKILL: mehrere Kandidaten -> beste Version -> Sanitizer
         reply_html = generate_overkill_reply(body_html)
-        combined_html = _combine_reply_with_history(reply_html, body_html)
 
         try:
-            draft_id = client.create_reply_draft(original_id=msg_id, html_body=combined_html)
+            draft_id = client.create_reply_draft(original_id=msg_id, html_body=reply_html)
             drafted += 1
             draft_ids.append(draft_id)
         except Exception as e:
             draft_ids.append(f"[Draft-Fehler für {msg_id}: {e}]")
 
     return {"drafted_count": drafted, "drafted_ids": draft_ids}
+
 
 def node_summarize(state: AppState) -> AppState:
     drafted = state.get("drafted_count", 0)
@@ -424,6 +408,7 @@ graph_autodraft = builder_autodraft.compile()
 # =================================
 # ====== CHAT GRAPH (CONVERSATION)
 # =================================
+
 def call_model(state: MessagesState) -> Dict[str, Any]:
     msgs = [SystemMessage(content=SYSTEM)] + state["messages"]
     ai = _try_invoke_with_fallback(msgs)
