@@ -271,9 +271,10 @@ def node_generate_drafts_body_only(state: AppState) -> AppState:
 
         # 2) LLM nur mit E-Mail-Body füttern
         user_text = (
-            "Erstelle eine höfliche, hilfreiche und konkrete Antwort als HTML (ohne Signatur, "
-            "ohne Firmenfußzeile). Antworte ausschließlich basierend auf folgendem E-Mail-Body. "
-            "Wenn unklar, bitte kurz und präzise nachfragen. "
+            "Erstelle eine höfliche, hilfreiche und konkrete Antwort als HTML unterschreibe mit sleepingbagREBEL."
+            "Antworte ausschließlich basierend auf folgendem E-Mail-Body. "
+            "Gib ausschließlich den email body zurück"
+            "Gib nur den Email Body zurück"
             "Antworte in der Sprache des folgenden Inhalts.\n\n"
             "EMAIL_BODY_HTML_START\n"
             f"{body_html}\n"
@@ -357,6 +358,7 @@ graph_chat = builder_chat.compile()
 # =================================
 # Für bestehende Deployments kann 'graph' auf den Autodraft-Graph zeigen.
 graph = graph_autodraft
+
 
 
 
