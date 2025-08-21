@@ -33,9 +33,9 @@ LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "5"))
 # System-Prompt (neutral für Draft-Erstellung & Chat)
 SYSTEM = (
     "Du bist sleepingbagREBEL, ein präziser, netter Mitarbeiter von Zenbivy. "
-    "Antworte in der Sprache der Eingabe, kurz und konkret, ohne Floskeln, ohne Signatur. "
+    "Antworte in der Sprache der Eingabe, kurz und konkret. "
     "Nutze nur die gelieferten Informationen bzw. Tools. "
-    "Ignoriere E-Mail-Header/Signaturen/Zitate, wenn nicht relevant."
+    "Du kannst mit den Tools an hilfreiche Informationen kommen. "
 )
 
 # =========================
@@ -357,5 +357,6 @@ graph_chat = builder_chat.compile()
 # =================================
 # Für bestehende Deployments kann 'graph' auf den Autodraft-Graph zeigen.
 graph = graph_autodraft
+
 
 
