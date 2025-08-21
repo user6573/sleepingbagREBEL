@@ -1,6 +1,6 @@
-# graph.py
+# graph.py — Overkill Email Drafts
 from __future__ import annotations
-import os, time, random
+import os, time, random, re
 import datetime as dt
 from typing import TypedDict, List, Optional, Dict, Any
 from pathlib import Path
@@ -24,22 +24,28 @@ CLIENT_SECRET = os.environ["MS_CLIENT_SECRET"]   # Client secret
 SHARED_MAILBOX = os.environ["MS_SHARED_MAILBOX"] # z.B. "friends@zenbivy.eu"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
-# --- Modell/Token-Config (angepasst) ---
+# --- Modell/Token-Config (OVERKILL) ---
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-7-sonnet-latest")  # fix statt *-latest 3.5
-ANTHROPIC_MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", "50000"))      # 50k Output (falls erlaubt)
-ANTHROPIC_OUTPUT_128K = os.getenv("ANTHROPIC_OUTPUT_128K", "0") == "1"      # optionaler Beta-Header für 128k
+# Default: Sonnet 3.7 (größtes Output-Limit) + 128k-Beta aktiv
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-7-sonnet-latest")
+ANTHROPIC_MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", "90000"))  # groß, aber unter 128k
+ANTHROPIC_OUTPUT_128K = os.getenv("ANTHROPIC_OUTPUT_128K", "1") == "1"
 ANTHROPIC_FALLBACK_MODEL = os.getenv("ANTHROPIC_FALLBACK_MODEL", "claude-sonnet-4-20250514")
+# Multi-Entwurf + Auswahl (Self-critique)
+ANTHROPIC_N_CANDIDATES = int(os.getenv("ANTHROPIC_N_CANDIDATES", "2"))   # 2–3 ist sinnvoll
+CRITIQUE_STRICT = os.getenv("CRITIQUE_STRICT", "1") == "1"
 
 # Wie weit zurück (in Minuten) E-Mails geholt werden sollen
 LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "5"))
+# Reply-Modus: "reply" (Standard), "reply_all" oder "new" (neuer Entwurf)
 
-# System-Prompt (neutral für Draft-Erstellung & Chat)
+# System-Prompt für beide Graphen
 SYSTEM = (
     "Du bist sleepingbagREBEL, ein präziser, netter Mitarbeiter von Zenbivy. "
-    "Antworte in der Sprache der Eingabe, kurz und konkret. "
+    "Antworte in der Sprache der Eingabe, kurz, konkret und korrekt. "
     "Nutze nur die gelieferten Informationen bzw. Tools. "
-    "Du kannst mit den Tools an hilfreiche Informationen kommen. "
+    "Wenn Informationen fehlen, stelle gezielte, knappe Rückfragen. "
+    "Rendere Antworten als sauberes HTML ohne <html>/<head>/<body>-Wrapper."
 )
 
 # =========================
@@ -122,7 +128,6 @@ _TOOL_MAP = {t.name: t for t in TOOLS}
 # =========================
 # ========= LLM ===========
 # =========================
-# Optionaler Beta-Header für 128k Output (nur Sonnet 3.7)
 _extra_headers = {}
 if ANTHROPIC_OUTPUT_128K:
     _extra_headers["anthropic-beta"] = "output-128k-2025-02-19"
@@ -136,6 +141,7 @@ llm = ChatAnthropic(
 )
 llm_with_tools = llm.bind_tools(TOOLS)
 
+
 def _is_retryable_error(exc: Exception) -> bool:
     s = str(exc).lower()
     return any(k in s for k in [
@@ -143,16 +149,17 @@ def _is_retryable_error(exc: Exception) -> bool:
         "gateway", "service unavailable", "529", "429", "502", "503", "504"
     ])
 
-def _invoke_with_retry(_llm, msgs, attempts: int = 6, base: float = 0.5, cap: float = 20.0):
+
+def _invoke_with_retry(_llm, msgs, attempts: int = 7, base: float = 0.6, cap: float = 30.0):
     for i in range(attempts):
         try:
             return _llm.invoke(msgs, config=RunnableConfig())
         except Exception as e:
             if i == attempts - 1 or not _is_retryable_error(e):
                 raise
-            # Exponential backoff + jitter
-            sleep_s = min(cap, base * (2 ** i)) + random.uniform(0, 0.5)
+            sleep_s = min(cap, base * (2 ** i)) + random.uniform(0, 0.6)
             time.sleep(sleep_s)
+
 
 def _try_invoke_with_fallback(msgs):
     try:
@@ -163,17 +170,18 @@ def _try_invoke_with_fallback(msgs):
                 model=ANTHROPIC_FALLBACK_MODEL,
                 api_key=ANTHROPIC_API_KEY,
                 temperature=0.2,
-                max_tokens=min(ANTHROPIC_MAX_TOKENS, 64000),  # Sonnet 4: 64k Output
+                max_tokens=min(ANTHROPIC_MAX_TOKENS, 64000),
             ).bind_tools(TOOLS)
             return _invoke_with_retry(alt_llm, msgs)
         raise
 
+
 def run_agent_with_tools(user_text: str) -> str:
     """
-    Einmalige Tool-Schleife für einfache Prompts -> Textantwort.
+    Eine Tool-Schleife für einfache Prompts -> Textantwort (max. 3 Tool-Runden).
     """
     msgs: List[Any] = [SystemMessage(content=SYSTEM), HumanMessage(content=user_text)]
-    for _ in range(3):  # bis zu 3 Tool-Runden
+    for _ in range(3):
         ai: AIMessage = _try_invoke_with_fallback(msgs)
         msgs.append(ai)
         tool_calls = getattr(ai, "tool_calls", None) or []
@@ -193,6 +201,84 @@ def run_agent_with_tools(user_text: str) -> str:
             msgs.append(ToolMessage(content=str(res), name=name, tool_call_id=call.get("id")))
     return "Ich konnte die Anfrage nicht abschließen. Bitte schreibe an friends@zenbivy.eu."
 
+
+# ==============
+# === QUALITY ===
+# ==============
+_SANITIZE_TAGS_RE = re.compile(r"<(script|style|iframe|link|meta|object|embed)[\s\S]*?>[\s\S]*?</\\1>", re.IGNORECASE)
+_ON_EVENT_ATTR_RE = re.compile(r"\son[a-z]+=\"[^\"]*\"", re.IGNORECASE)
+_JS_URL_RE = re.compile(r"(javascript:)[^\"']*", re.IGNORECASE)
+
+
+def _sanitize_email_html(html: str) -> str:
+    if not html:
+        return html
+    # Entferne gefährliche Tags (block)
+    html = _SANITIZE_TAGS_RE.sub("", html)
+    # Entferne on* Handler
+    html = _ON_EVENT_ATTR_RE.sub("", html)
+    # Entferne javascript: URLs
+    html = _JS_URL_RE.sub("", html)
+    # Trim
+    return html.strip()
+
+def _combine_reply_with_history(reply_html: str, orig_html: str) -> str:
+    orig = _sanitize_email_html(orig_html)
+    if not reply_html:
+        reply_html = ""
+    return reply_html + "
+<hr>
+<div class=\"quoted-original\">" + (orig or "") + "</div>"
+
+
+def _candidate_prompt(body_html: str, variant_id: int) -> str:
+    return (
+        "Erstelle eine höfliche, hilfreiche und konkrete Antwort als sauberes HTML (ohne <html>/<head>/<body>). "
+        "Schließe mit ‘— sleepingbagREBEL’. "
+        "Antworte ausschließlich basierend auf folgendem E-Mail-Body. "
+        "Wenn Informationen fehlen, stelle am Ende maximal 3 prägnante Rückfragen als <ul>. "
+        "Achte auf: korrekte Sprache (automatisch erkennen), klare Struktur (<p>, <ul>, <ol>, <strong>), "
+        "präzise Produkthinweise. Nutze Links auf Zenbivy-Seiten nur, wenn sie explizit im Tool 'gear_guide' vorkommen. "
+        "Gib ausschließlich den E-Mail-Body (HTML) zurück, keine Erklärungen.\n\n"
+        "EMAIL_BODY_HTML_START\n"
+        f"{body_html}\n"
+        "EMAIL_BODY_HTML_END\n\n"
+        f"VARIANT: {variant_id}"
+    )
+
+
+def _critique_prompt(candidates: List[str], body_html: str) -> str:
+    rubric = (
+        "Bewerte die Kandidaten nach: (1) Korrektheit/Bezug zum Body, (2) Vollständigkeit, (3) Klarheit/Struktur, "
+        "(4) Ton/Markenstimme, (5) Sprachqualität. Korrigiere Mängel. Gib NUR das finale, verbessertes HTML zurück "
+        "(ohne <html>/<head>/<body>), mit Abschluss ‘— sleepingbagREBEL’. Keine Kommentare/Erklärungen."
+    )
+    joined = "\n\n".join([f"CANDIDATE_{i+1}_START\n{c}\nCANDIDATE_{i+1}_END" for i, c in enumerate(candidates)])
+    return (
+        f"{rubric}\n\nEMAIL_BODY_HTML_START\n{body_html}\nEMAIL_BODY_HTML_END\n\n{joined}"
+    )
+
+
+def generate_overkill_reply(body_html: str) -> str:
+    # 1) Kandidaten erstellen
+    n = max(1, min(ANTHROPIC_N_CANDIDATES, 5))
+    candidates: List[str] = []
+    for i in range(n):
+        user_text = _candidate_prompt(body_html, i + 1)
+        cand_html = run_agent_with_tools(user_text).strip()
+        candidates.append(cand_html)
+
+    final_html = candidates[-1]
+
+    # 2) Kritische Auswahl/Politur (zweiter Pass)
+    if n > 1 or CRITIQUE_STRICT:
+        critique_text = _critique_prompt(candidates, body_html)
+        final_html = run_agent_with_tools(critique_text).strip() or final_html
+
+    # 3) Sanitize
+    return _sanitize_email_html(final_html)
+
+
 # =========================
 # ==== MS GRAPH CLIENT ====
 # =========================
@@ -210,10 +296,6 @@ class GraphClient:
         return res["access_token"]
 
     def list_messages_since(self, since_iso: str, max_count: int = 50) -> List[Dict[str, Any]]:
-        """
-        Holt Mails aus der Inbox der Shared Mailbox mit Filter receivedDateTime >= since_iso.
-        since_iso muss z.B. '2025-08-20T09:10:00Z' sein (UTC).
-        """
         at = self.token()
         headers = {"Authorization": f"Bearer {at}"}
         params = {
@@ -229,9 +311,6 @@ class GraphClient:
         return data.get("value", [])
 
     def get_message_body(self, msg_id: str) -> str:
-        """
-        Liefert den RAW-Body (häufig HTML) der E-Mail.
-        """
         at = self.token()
         headers = {"Authorization": f"Bearer {at}"}
         url = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{msg_id}?$select=body"
@@ -240,83 +319,68 @@ class GraphClient:
         body = r.json().get("body", {})
         return body.get("content", "") or ""
 
-   def create_reply_draft(self, original_id: str, html_body: str, reply_all: bool = False) -> str:
-    """
-    Erzeugt einen Antwort-ENTWURF (optional "Antwort an alle") zu einer bestehenden Nachricht
-    und lässt den bisherigen Verlauf sichtbar. Gibt die Draft-ID zurück. NICHT senden.
+    def create_reply_draft(self, original_id: str, html_body: str, mode: str = "reply") -> str:
+        """
+        Erzeugt einen ENTWURF **als Antwort** auf eine bestehende Nachricht.
+        mode: "reply" (Standard) oder "reply_all".
+        Gibt die Draft-ID zurück. NICHT senden.
+        """
+        at = self.token()
+        headers = {"Authorization": f"Bearer {at}", "Content-Type": "application/json"}
 
-    - Wir erstellen zuerst den Reply-Draft via createReply/All.
-    - Dann laden wir den aktuellen Draft-Body (der bei vielen Tenants bereits den Verlauf enthält).
-    - Falls leer, quoten wir den Original-Mail-Body manuell in einem Block.
-    - Anschließend patchen wir den Draft so, dass deine Antwort OBEN steht und der Verlauf darunter sichtbar bleibt.
-    """
-    at = self.token()
-    headers = {"Authorization": f"Bearer {at}", "Content-Type": "application/json"}
+        # Original-Metadaten holen (für Fallbacks bei Empfängern)
+        meta_url = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}"
+        meta_sel = "$select=from,toRecipients,ccRecipients,subject"
+        r_meta = requests.get(f"{meta_url}?{meta_sel}", headers=headers, timeout=20)
+        r_meta.raise_for_status()
+        meta = r_meta.json()
+        orig_from = (meta.get("from") or {}).get("emailAddress")
+        orig_to = meta.get("toRecipients") or []
+        orig_cc = meta.get("ccRecipients") or []
 
-    # 1) Reply-Entwurf anlegen (Reply oder Reply-All)
-    action = "createReplyAll" if reply_all else "createReply"
-    url_create = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}/{action}"
-    r = requests.post(url_create, headers=headers, timeout=20)
-    r.raise_for_status()
-    draft = r.json()
-    draft_id = draft["id"]
+        # 1) Reply-Entwurf anlegen (reply oder reply_all)
+        if mode == "reply_all":
+            url_create = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}/createReplyAll"
+        else:
+            url_create = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}/createReply"
 
-    # 2) Vorhandenen Draft-Body laden (häufig enthält dieser bereits den zitierten Verlauf)
-    draft_body_html = ""
-    try:
-        url_get = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{draft_id}?$select=body"
-        r_get = requests.get(url_get, headers={"Authorization": f"Bearer {at}"}, timeout=20)
-        r_get.raise_for_status()
-        draft_body_html = (r_get.json().get("body", {}) or {}).get("content", "") or ""
-    except Exception:
-        draft_body_html = ""
+        r = requests.post(url_create, headers=headers, timeout=20)
+        r.raise_for_status()
+        draft = r.json()
+        draft_id = draft["id"]
 
-    # 3) Fallback: Wenn kein Verlauf im Draft-Body ist, Original-Mail-Body manuell quoten
-    if not draft_body_html:
-        try:
-            original_html = self.get_message_body(original_id)
-            draft_body_html = (
-                "<div style='margin-top:12px; border-left:2px solid #ddd; padding-left:12px;'>"
-                f"{original_html}"
-                "</div>"
-            )
-        except Exception:
-            draft_body_html = ""
+        # 2) Body setzen (HTML) und – falls nötig – Empfänger absichern
+        patch: Dict[str, Any] = {"body": {"contentType": "HTML", "content": html_body}}
 
-    # 4) Deine Antwort oben, Verlauf darunter
-    combined_html = f"{html_body}\n<br><br>\n{draft_body_html}" if draft_body_html else html_body
+        # Bei einfachem Reply sicherstellen, dass der Absender im To steht
+        if mode == "reply" and orig_from:
+            patch["toRecipients"] = [{"emailAddress": orig_from}]
+        # Bei reply_all NICHT überschreiben (Graph füllt To/Cc korrekt); nur Body patchen
 
-    # 5) Draft-Body setzen
-    url_patch = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{draft_id}"
-    patch = {"body": {"contentType": "HTML", "content": combined_html}}
-    r2 = requests.patch(url_patch, headers=headers, json=patch, timeout=20)
-    r2.raise_for_status()
-    return draft_id
+        url_patch = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{draft_id}"
+        r2 = requests.patch(url_patch, headers=headers, json=patch, timeout=20)
+        r2.raise_for_status()
+        return draft_id
 
+# =========================
 # ======= HELPERS =========
 # =========================
+
 def utc_iso_now_minus_minutes(minutes: int) -> str:
-    """
-    Gibt eine UTC-ISO8601 Zeit mit Z-Suffix zurück, z.B. '2025-08-20T09:10:00Z'
-    """
     return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 # =========================
 # ====== AUTODRAFT GRAPH ==
 # =========================
 class AppState(TypedDict, total=False):
-    # für LangGraph
     messages: List[Any]
-    # eigene Felder
     lookback_iso: str
     new_emails: List[Dict[str, Any]]
     drafted_count: int
     drafted_ids: List[str]
 
+
 def node_fetch_recent_emails(state: AppState) -> AppState:
-    """
-    Holt E-Mails der letzten LOOKBACK_MINUTES Minuten (nur IDs und Timestamps).
-    """
     client = GraphClient()
     since_iso = utc_iso_now_minus_minutes(LOOKBACK_MINUTES)
     msgs = client.list_messages_since(since_iso=since_iso, max_count=50)
@@ -325,45 +389,29 @@ def node_fetch_recent_emails(state: AppState) -> AppState:
         "new_emails": msgs,
     }
 
+
 def node_generate_drafts_body_only(state: AppState) -> AppState:
-    """
-    Lädt für jede Nachricht den tatsächlichen Body (RAW, zumeist HTML) und
-    erstellt auf Basis *ausschließlich dieses Bodys* eine kurze HTML-Antwort.
-    Speichert die Antwort als Draft.
-    """
     client = GraphClient()
     drafted = 0
     draft_ids: List[str] = []
 
     for m in state.get("new_emails", []):
         msg_id = m["id"]
-
-        # 1) Original-Body (RAW; häufig HTML) holen
         body_html = client.get_message_body(msg_id)
 
-        # 2) LLM nur mit E-Mail-Body füttern
-        user_text = (
-            "Erstelle eine höfliche, hilfreiche und konkrete Antwort als HTML unterschreibe mit sleepingbagREBEL."
-            "Antworte ausschließlich basierend auf folgendem E-Mail-Body. "
-            "Gib ausschließlich den email body zurück"
-            "Gib nur den Email Body zurück"
-            "Antworte in der Sprache des folgenden Inhalts.\n\n"
-            "EMAIL_BODY_HTML_START\n"
-            f"{body_html}\n"
-            "EMAIL_BODY_HTML_END"
-        )
+        # OVERKILL: mehrere Kandidaten -> beste Version -> Sanitizer
+        reply_html = generate_overkill_reply(body_html)
+        combined_html = _combine_reply_with_history(reply_html, body_html)
 
-        reply_html = run_agent_with_tools(user_text).strip()
-
-        # 3) Draft im Shared Mailbox erstellen
         try:
-            draft_id = client.create_reply_draft(original_id=msg_id, html_body=reply_html)
+            draft_id = client.create_reply_draft(original_id=msg_id, html_body=combined_html)
             drafted += 1
             draft_ids.append(draft_id)
         except Exception as e:
             draft_ids.append(f"[Draft-Fehler für {msg_id}: {e}]")
 
     return {"drafted_count": drafted, "drafted_ids": draft_ids}
+
 
 def node_summarize(state: AppState) -> AppState:
     drafted = state.get("drafted_count", 0)
@@ -395,10 +443,8 @@ graph_autodraft = builder_autodraft.compile()
 # =================================
 # ====== CHAT GRAPH (CONVERSATION)
 # =================================
+
 def call_model(state: MessagesState) -> Dict[str, Any]:
-    """
-    Fügt den System-Prompt voran und ruft das Modell (mit Tools) auf.
-    """
     msgs = [SystemMessage(content=SYSTEM)] + state["messages"]
     ai = _try_invoke_with_fallback(msgs)
     return {"messages": [ai]}
@@ -412,10 +458,9 @@ builder_chat.add_node("call_model", call_model)
 builder_chat.add_node("tools", tool_node)
 
 builder_chat.add_edge(START, "call_model")
-# Wenn das Modell Tools anfordert -> Tools ausführen, dann zurück zum Modell
 builder_chat.add_conditional_edges(
     "call_model",
-    tools_condition,  # entscheidet anhand von tool_calls
+    tools_condition,
     {
         "tools": "tools",
         END: END,
@@ -428,5 +473,5 @@ graph_chat = builder_chat.compile()
 # =================================
 # ===== Default-Export (optional) ==
 # =================================
+# Für bestehende Deployments zeigt der Default auf Autodraft
 graph = graph_autodraft
-
