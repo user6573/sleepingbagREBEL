@@ -37,6 +37,7 @@ CRITIQUE_STRICT = os.getenv("CRITIQUE_STRICT", "1") == "1"
 
 # Wie weit zurück (in Minuten) E-Mails geholt werden sollen
 LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "5"))
+# Reply-Modus: "reply" (Standard), "reply_all" oder "new" (neuer Entwurf)
 
 # System-Prompt für beide Graphen
 SYSTEM = (
@@ -310,16 +311,35 @@ class GraphClient:
         body = r.json().get("body", {})
         return body.get("content", "") or ""
 
-    def create_reply_draft(self, original_id: str, html_body: str) -> str:
+    def create_reply_draft(self, original_id: str, html_body: str, mode: str = "reply") -> str:
+        """
+        Erzeugt einen ENTWURF als Antwort auf eine bestehende Nachricht.
+        mode: "reply" (Standard) oder "reply_all". Für neuen Entwurf siehe optionalen Zweig.
+        Gibt die Draft-ID zurück. NICHT senden.
+        """
         at = self.token()
         headers = {"Authorization": f"Bearer {at}", "Content-Type": "application/json"}
 
-        # 1) Reply-Entwurf anlegen
-        url_create = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}/createReply"
-        r = requests.post(url_create, headers=headers, timeout=20)
-        r.raise_for_status()
-        draft = r.json()
-        draft_id = draft["id"]
+        # 1) Reply-Entwurf anlegen (reply oder reply_all)
+        if mode == "reply_all":
+            url_create = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}/createReplyAll"
+        elif mode == "new":
+            # Optional: Neuen Entwurf erstellen (kein Reply). Normalerweise nicht genutzt.
+            url_create = None
+        else:
+            url_create = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}/createReply"
+
+        if url_create:
+            r = requests.post(url_create, headers=headers, timeout=20)
+            r.raise_for_status()
+            draft = r.json()
+            draft_id = draft["id"]
+        else:
+            # Neuer Entwurf (falls explizit gewünscht)
+            create_url = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages"
+            r = requests.post(create_url, headers=headers, json={"isDraft": True}, timeout=20)
+            r.raise_for_status()
+            draft_id = r.json()["id"]
 
         # 2) Body setzen (HTML)
         url_patch = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{draft_id}"
