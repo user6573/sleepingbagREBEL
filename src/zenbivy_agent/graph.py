@@ -24,22 +24,23 @@ CLIENT_SECRET = os.environ["MS_CLIENT_SECRET"]   # Client secret
 SHARED_MAILBOX = os.environ["MS_SHARED_MAILBOX"] # z.B. "friends@zenbivy.eu"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
-# --- Modell/Token-Config (angepasst) ---
+# --- Modell/Token-Config (robust) ---
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-7-sonnet-latest")  # fix statt *-latest 3.5
-ANTHROPIC_MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", "50000"))      # 50k Output (falls erlaubt)
-ANTHROPIC_OUTPUT_128K = os.getenv("ANTHROPIC_OUTPUT_128K", "0") == "1"      # optionaler Beta-Header für 128k
-ANTHROPIC_FALLBACK_MODEL = os.getenv("ANTHROPIC_FALLBACK_MODEL", "claude-sonnet-4-20250514")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-7-sonnet-20250219")
+# sichere Default-Grenze: 8000 Output-Token (ältere Sonnet-Modelle haben 8192 Limit)
+REQ_MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", "8000"))
+ANTHROPIC_OUTPUT_128K = os.getenv("ANTHROPIC_OUTPUT_128K", "0") == "1"
+ANTHROPIC_FALLBACK_MODEL = os.getenv("ANTHROPIC_FALLBACK_MODEL", "claude-3-5-sonnet-20241022")
 
 # Wie weit zurück (in Minuten) E-Mails geholt werden sollen
 LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "5"))
 
-# System-Prompt (neutral für Draft-Erstellung & Chat)
+# System-Prompt
 SYSTEM = (
     "Du bist sleepingbagREBEL, ein präziser, netter Mitarbeiter von Zenbivy. "
     "Antworte in der Sprache der Eingabe, kurz und konkret. "
     "Nutze nur die gelieferten Informationen bzw. Tools. "
-    "Du kannst mit den Tools an hilfreiche Informationen kommen. "
+    "Wenn du unsicher bist, frage NICHT zurück, sondern liefere den besten Vorschlag. "
 )
 
 # =========================
@@ -75,7 +76,7 @@ def bedingungen(kategorie: str) -> str:
 @tool("gear_guide")
 def gear_guide(name: str) -> dict:
     """
-    Lädt vordefinierte Zenbivy-Seiteninhalte grob. Verfügbar:
+    Lädt vordefinierte Zenbivy-Seiten grob. Verfügbar:
     - Größentabelle, Gebrauchsanweisung, Accessory Guide, Kontakt
     """
     if name not in _SOURCES:
@@ -95,8 +96,7 @@ _DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).resolve().parents[2] / "da
 @tool("wieder_verfuegbar")
 def wieder_verfuegbar(datei: str) -> str:
     """
-    Liest eine Textdatei aus dem data/-Ordner (z. B. 'Light Quilt -4°C.txt') und
-    gibt den gesamten Inhalt zurück (Termine/Verfügbarkeit).
+    Liest eine Textdatei aus data/ (z. B. 'Light Quilt -4°C.txt') und gibt den Inhalt zurück.
     """
     fname = f"{datei}.txt" if not datei.lower().endswith(".txt") else datei
     p = _DATA_DIR / fname
@@ -110,8 +110,7 @@ def wieder_verfuegbar(datei: str) -> str:
 @tool("search_web")
 def search_web(query: str, restrict_to_zenbivy: bool = True) -> dict:
     """
-    Platzhalter-Websuche (minimal). Für produktiv: Tavily verwenden.
-    Hier nur Rückgabe eines Links, damit das Tool prinzipiell funktioniert.
+    Platzhalter-Websuche (minimal). Für produktiv: Tavily/Serper nutzen.
     """
     base = "https://zenbivy.eu" if restrict_to_zenbivy else "https://duckduckgo.com/?q="
     return {"query": query, "note": "Demo-Suche", "url": base}
@@ -122,16 +121,17 @@ _TOOL_MAP = {t.name: t for t in TOOLS}
 # =========================
 # ========= LLM ===========
 # =========================
-# Optionaler Beta-Header für 128k Output (nur Sonnet 3.7)
 _extra_headers = {}
 if ANTHROPIC_OUTPUT_128K:
     _extra_headers["anthropic-beta"] = "output-128k-2025-02-19"
+# sichere max_tokens:
+SAFE_MAX_TOKENS = REQ_MAX_TOKENS if ANTHROPIC_OUTPUT_128K else min(REQ_MAX_TOKENS, 8000)
 
 llm = ChatAnthropic(
     model=ANTHROPIC_MODEL,
     api_key=ANTHROPIC_API_KEY,
     temperature=0.2,
-    max_tokens=ANTHROPIC_MAX_TOKENS,
+    max_tokens=SAFE_MAX_TOKENS,
     extra_headers=_extra_headers or None,
 )
 llm_with_tools = llm.bind_tools(TOOLS)
@@ -150,7 +150,6 @@ def _invoke_with_retry(_llm, msgs, attempts: int = 6, base: float = 0.5, cap: fl
         except Exception as e:
             if i == attempts - 1 or not _is_retryable_error(e):
                 raise
-            # Exponential backoff + jitter
             sleep_s = min(cap, base * (2 ** i)) + random.uniform(0, 0.5)
             time.sleep(sleep_s)
 
@@ -163,7 +162,7 @@ def _try_invoke_with_fallback(msgs):
                 model=ANTHROPIC_FALLBACK_MODEL,
                 api_key=ANTHROPIC_API_KEY,
                 temperature=0.2,
-                max_tokens=min(ANTHROPIC_MAX_TOKENS, 64000),  # Sonnet 4: 64k Output
+                max_tokens=min(SAFE_MAX_TOKENS, 8000),
             ).bind_tools(TOOLS)
             return _invoke_with_retry(alt_llm, msgs)
         raise
@@ -178,7 +177,7 @@ def run_agent_with_tools(user_text: str) -> str:
         msgs.append(ai)
         tool_calls = getattr(ai, "tool_calls", None) or []
         if not tool_calls:
-            return ai.content or ""
+            return (ai.content or "").strip()
         for call in tool_calls:
             name = call.get("name")
             args = call.get("args") or {}
@@ -209,16 +208,22 @@ class GraphClient:
             raise RuntimeError(f"Tokenfehler: {res.get('error_description')}")
         return res["access_token"]
 
+    def _auth_headers(self, prefer_html: bool = False) -> Dict[str, str]:
+        h = {"Authorization": f"Bearer {self.token()}"}
+        if prefer_html:
+            # erzwingt HTML-Inhalt im Body
+            h["Prefer"] = 'outlook.body-content-type="html"'
+        return h
+
     def list_messages_since(self, since_iso: str, max_count: int = 50) -> List[Dict[str, Any]]:
         """
-        Holt Mails aus der Inbox der Shared Mailbox mit Filter receivedDateTime >= since_iso.
-        since_iso muss z.B. '2025-08-20T09:10:00Z' sein (UTC).
+        Holt Mails aus der Inbox der Shared Mailbox mit Filter receivedDateTime >= since_iso (UTC).
+        since_iso z.B. '2025-08-20T09:10:00Z'
         """
-        at = self.token()
-        headers = {"Authorization": f"Bearer {at}"}
+        headers = self._auth_headers()
         params = {
             "$top": str(max_count),
-            "$select": "id,receivedDateTime",
+            "$select": "id,receivedDateTime,subject,from",
             "$orderby": "receivedDateTime desc",
             "$filter": f"receivedDateTime ge {since_iso}",
         }
@@ -228,34 +233,45 @@ class GraphClient:
         data = r.json()
         return data.get("value", [])
 
-    def get_message_body(self, msg_id: str) -> str:
+    def get_message_core(self, msg_id: str) -> Dict[str, Any]:
         """
-        Liefert den RAW-Body (häufig HTML) der E-Mail.
+        Liefert Kernfelder inkl. HTML-Body, Absender, Betreff, Datum.
         """
-        at = self.token()
-        headers = {"Authorization": f"Bearer {at}"}
-        url = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{msg_id}?$select=body"
-        r = requests.get(url, headers=headers, timeout=20)
+        headers = self._auth_headers(prefer_html=True)
+        url = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{msg_id}"
+        params = {
+            "$select": "id,subject,from,sentDateTime,receivedDateTime,body",
+        }
+        r = requests.get(url, headers=headers, params=params, timeout=20)
         r.raise_for_status()
-        body = r.json().get("body", {})
-        return body.get("content", "") or ""
+        data = r.json()
+        body = data.get("body", {}) or {}
+        return {
+            "id": data.get("id"),
+            "subject": data.get("subject") or "",
+            "from": ((data.get("from") or {}).get("emailAddress") or {}).get("name") or "",
+            "from_addr": ((data.get("from") or {}).get("emailAddress") or {}).get("address") or "",
+            "sentDateTime": data.get("sentDateTime"),
+            "receivedDateTime": data.get("receivedDateTime"),
+            "body_html": body.get("content", "") or "",
+        }
 
     def create_reply_draft(self, original_id: str, html_body: str) -> str:
         """
-        Erzeugt einen Antwort-ENTWURF zu einer bestehenden Nachricht.
-        Gibt die Draft-ID zurück. NICHT senden.
+        Erzeugt einen Antwort-ENTWURF zu einer bestehenden Nachricht (createReply),
+        setzt anschließend den finalen HTML-Body.
         """
-        at = self.token()
-        headers = {"Authorization": f"Bearer {at}", "Content-Type": "application/json"}
+        headers = self._auth_headers()
+        headers["Content-Type"] = "application/json"
 
-        # 1) Reply-Entwurf anlegen
+        # 1) Reply-Entwurf anlegen -> behält Threading-Header (In-Reply-To / References)
         url_create = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}/createReply"
         r = requests.post(url_create, headers=headers, timeout=20)
         r.raise_for_status()
         draft = r.json()
         draft_id = draft["id"]
 
-        # 2) Body setzen (HTML)
+        # 2) Body setzen (HTML). Keine Header anfassen!
         url_patch = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{draft_id}"
         patch = {"body": {"contentType": "HTML", "content": html_body}}
         r2 = requests.patch(url_patch, headers=headers, json=patch, timeout=20)
@@ -271,6 +287,64 @@ def utc_iso_now_minus_minutes(minutes: int) -> str:
     """
     return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+def _format_dt_for_quote(iso: Optional[str]) -> str:
+    """
+    Formatiert ISO-Datum knapp für Quote-Kopfzeile.
+    """
+    if not iso:
+        return ""
+    try:
+        d = dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(dt.timezone(dt.timedelta(hours=0)))
+        # Beispiel: 2025-08-21 09:15 UTC
+        return d.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return iso or ""
+
+def build_reply_with_history(reply_html: str, original_html: str,
+                             from_name: str = "", sent_iso: str = "", subject: str = "") -> str:
+    """
+    Baut den finalen Antwort-HTML-Body:
+    - oben: KI-Antwort
+    - darunter: Quote-Header + Original in <blockquote>
+    """
+    # einfache, robuste Quote-Header-Zeile
+    when = _format_dt_for_quote(sent_iso)
+    header_line = ""
+    if when or from_name or subject:
+        header_line = (
+            f'<div style="margin-top:16px;margin-bottom:8px;font-size:12px;color:#555;">'
+            f'----- Original Message -----<br>'
+            f'Von: {from_name or "Unbekannt"}<br>'
+            f'Gesendet: {when or "Unbekannt"}<br>'
+            f'Betreff: {subject or "(kein Betreff)"}'
+            f'</div>'
+        )
+
+    quoted = (
+        '<blockquote style="margin:0;padding-left:.8em;border-left:2px solid #ccc;">'
+        f'{original_html}'
+        '</blockquote>'
+    )
+
+    final_html = (
+        f'{reply_html}'
+        f'<br><br>{header_line}'
+        f'{quoted}'
+    )
+    return final_html
+
+def sanitize_llm_html(s: str) -> str:
+    """
+    Entfernt Backticks/Codefences etc., falls das Modell versehentlich formatiert.
+    """
+    t = (s or "").strip()
+    if t.startswith("```"):
+        t = t.strip("`").strip()
+        # häufig beginnt es dann mit html/lang-Markern -> entfernen
+        if t.lower().startswith("html"):
+            t = t[4:].lstrip()
+    return t
+
 # =========================
 # ====== AUTODRAFT GRAPH ==
 # =========================
@@ -285,7 +359,7 @@ class AppState(TypedDict, total=False):
 
 def node_fetch_recent_emails(state: AppState) -> AppState:
     """
-    Holt E-Mails der letzten LOOKBACK_MINUTES Minuten (nur IDs und Timestamps).
+    Holt E-Mails der letzten LOOKBACK_MINUTES Minuten (Basisdaten).
     """
     client = GraphClient()
     since_iso = utc_iso_now_minus_minutes(LOOKBACK_MINUTES)
@@ -297,9 +371,11 @@ def node_fetch_recent_emails(state: AppState) -> AppState:
 
 def node_generate_drafts_body_only(state: AppState) -> AppState:
     """
-    Lädt für jede Nachricht den tatsächlichen Body (RAW, zumeist HTML) und
-    erstellt auf Basis *ausschließlich dieses Bodys* eine kurze HTML-Antwort.
-    Speichert die Antwort als Draft.
+    Für jede neue Nachricht:
+    - Original (Body+Metadaten) laden
+    - KI-Antwort als HTML generieren (nur basierend auf Body)
+    - Antwort + zitiertes Original kombinieren
+    - createReply + PATCH (Body) -> Draft speichern (bleibt im Thread)
     """
     client = GraphClient()
     drafted = 0
@@ -308,26 +384,51 @@ def node_generate_drafts_body_only(state: AppState) -> AppState:
     for m in state.get("new_emails", []):
         msg_id = m["id"]
 
-        # 1) Original-Body (RAW; häufig HTML) holen
-        body_html = client.get_message_body(msg_id)
+        # 1) Original inkl. HTML-Body, From, Betreff, Datum
+        core = client.get_message_core(msg_id)
+        body_html = core["body_html"]
+        from_name = core["from"]
+        sent_iso = core["sentDateTime"]
+        subject = core["subject"]
 
-        # 2) LLM nur mit E-Mail-Body füttern
+        if not body_html:
+            # leere oder reine-Plain/Weird Mails: trotzdem Entwurf erzeugen
+            body_html = "<div>(Kein Inhalt erkannt)</div>"
+
+        # 2) LLM nur mit E-Mail-Body füttern (nur Body zurückgeben)
         user_text = (
-            "Erstelle eine höfliche, hilfreiche und konkrete Antwort als HTML unterschreibe mit sleepingbagREBEL."
+            "Erstelle eine höfliche, hilfreiche und konkrete Antwort als HTML und unterschreibe mit 'sleepingbagREBEL'. "
             "Antworte ausschließlich basierend auf folgendem E-Mail-Body. "
-            "Gib ausschließlich den email body zurück"
-            "Gib nur den Email Body zurück"
+            "Gib NUR den Email-Body der Antwort zurück (keinen Betreff, keine Meta-Zeilen, kein Codeblock). "
             "Antworte in der Sprache des folgenden Inhalts.\n\n"
             "EMAIL_BODY_HTML_START\n"
             f"{body_html}\n"
             "EMAIL_BODY_HTML_END"
         )
 
-        reply_html = run_agent_with_tools(user_text).strip()
+        reply_html_raw = run_agent_with_tools(user_text)
+        reply_html = sanitize_llm_html(reply_html_raw)
 
-        # 3) Draft im Shared Mailbox erstellen
+        # minimale Fallback-Antwort, falls Modell nichts zurückgibt
+        if not reply_html:
+            reply_html = (
+                "<p>Vielen Dank für Ihre Nachricht! "
+                "Wir prüfen Ihr Anliegen und melden uns in Kürze.</p>"
+                "<p>Beste Grüße<br>sleepingbagREBEL</p>"
+            )
+
+        # 3) Antwort + zitiertes Original kombinieren (wie in Outlook)
+        combined_html = build_reply_with_history(
+            reply_html=reply_html,
+            original_html=body_html,
+            from_name=from_name,
+            sent_iso=sent_iso,
+            subject=subject,
+        )
+
+        # 4) Draft im Thread erstellen (createReply) & Body patchen
         try:
-            draft_id = client.create_reply_draft(original_id=msg_id, html_body=reply_html)
+            draft_id = client.create_reply_draft(original_id=msg_id, html_body=combined_html)
             drafted += 1
             draft_ids.append(draft_id)
         except Exception as e:
@@ -373,19 +474,16 @@ def call_model(state: MessagesState) -> Dict[str, Any]:
     ai = _try_invoke_with_fallback(msgs)
     return {"messages": [ai]}
 
-# Tool-Knoten für automatische Toolausführung
 tool_node = ToolNode(TOOLS)
 
-# Graph bauen (Chat)
 builder_chat = StateGraph(MessagesState)
 builder_chat.add_node("call_model", call_model)
 builder_chat.add_node("tools", tool_node)
 
 builder_chat.add_edge(START, "call_model")
-# Wenn das Modell Tools anfordert -> Tools ausführen, dann zurück zum Modell
 builder_chat.add_conditional_edges(
     "call_model",
-    tools_condition,  # entscheidet anhand von tool_calls
+    tools_condition,
     {
         "tools": "tools",
         END: END,
@@ -396,6 +494,6 @@ builder_chat.add_edge("tools", "call_model")
 graph_chat = builder_chat.compile()
 
 # =================================
-# ===== Default-Export (optional) ==
+# ===== Default-Export (run) ======
 # =================================
 graph = graph_autodraft
