@@ -34,6 +34,8 @@ ANTHROPIC_FALLBACK_MODEL = os.getenv("ANTHROPIC_FALLBACK_MODEL", "claude-sonnet-
 # Multi-Entwurf + Auswahl (Self-critique)
 ANTHROPIC_N_CANDIDATES = int(os.getenv("ANTHROPIC_N_CANDIDATES", "2"))   # 2–3 ist sinnvoll
 CRITIQUE_STRICT = os.getenv("CRITIQUE_STRICT", "1") == "1"
+REPLY_MODE = os.getenv("REPLY_MODE", "reply").lower()  # "reply" or "reply_all"
+
 
 # Wie weit zurück (in Minuten) E-Mails geholt werden sollen
 LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "5"))
@@ -310,12 +312,13 @@ class GraphClient:
         body = r.json().get("body", {})
         return body.get("content", "") or ""
 
-    def create_reply_draft(self, original_id: str, html_body: str) -> str:
+    def create_reply_draft(self, original_id: str, html_body: str, reply_all: bool = False) -> str:
         at = self.token()
         headers = {"Authorization": f"Bearer {at}", "Content-Type": "application/json"}
 
         # 1) Reply-Entwurf anlegen
-        url_create = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}/createReply"
+        endpoint = "createReplyAll" if reply_all else "createReply"
+        url_create = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}/{endpoint}"
         r = requests.post(url_create, headers=headers, timeout=20)
         r.raise_for_status()
         draft = r.json()
@@ -369,7 +372,7 @@ def node_generate_drafts_body_only(state: AppState) -> AppState:
         reply_html = generate_overkill_reply(body_html)
 
         try:
-            draft_id = client.create_reply_draft(original_id=msg_id, html_body=reply_html)
+            draft_id = client.create_reply_draft(original_id=msg_id, html_body=reply_html, reply_all=(REPLY_MODE == "reply_all"))
             drafted += 1
             draft_ids.append(draft_id)
         except Exception as e:
