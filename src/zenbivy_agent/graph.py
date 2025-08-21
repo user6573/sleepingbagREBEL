@@ -135,7 +135,7 @@ if ANTHROPIC_OUTPUT_128K:
 llm = ChatAnthropic(
     model=ANTHROPIC_MODEL,
     api_key=ANTHROPIC_API_KEY,
-    temperature=0.2,
+    temperature=0,
     max_tokens=ANTHROPIC_MAX_TOKENS,
     extra_headers=_extra_headers or None,
 )
@@ -313,37 +313,43 @@ class GraphClient:
 
     def create_reply_draft(self, original_id: str, html_body: str, mode: str = "reply") -> str:
         """
-        Erzeugt einen ENTWURF als Antwort auf eine bestehende Nachricht.
-        mode: "reply" (Standard) oder "reply_all". Für neuen Entwurf siehe optionalen Zweig.
+        Erzeugt einen ENTWURF **als Antwort** auf eine bestehende Nachricht.
+        mode: "reply" (Standard) oder "reply_all".
         Gibt die Draft-ID zurück. NICHT senden.
         """
         at = self.token()
         headers = {"Authorization": f"Bearer {at}", "Content-Type": "application/json"}
 
+        # Original-Metadaten holen (für Fallbacks bei Empfängern)
+        meta_url = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}"
+        meta_sel = "$select=from,toRecipients,ccRecipients,subject"
+        r_meta = requests.get(f"{meta_url}?{meta_sel}", headers=headers, timeout=20)
+        r_meta.raise_for_status()
+        meta = r_meta.json()
+        orig_from = (meta.get("from") or {}).get("emailAddress")
+        orig_to = meta.get("toRecipients") or []
+        orig_cc = meta.get("ccRecipients") or []
+
         # 1) Reply-Entwurf anlegen (reply oder reply_all)
         if mode == "reply_all":
             url_create = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}/createReplyAll"
-        elif mode == "new":
-            # Optional: Neuen Entwurf erstellen (kein Reply). Normalerweise nicht genutzt.
-            url_create = None
         else:
             url_create = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}/createReply"
 
-        if url_create:
-            r = requests.post(url_create, headers=headers, timeout=20)
-            r.raise_for_status()
-            draft = r.json()
-            draft_id = draft["id"]
-        else:
-            # Neuer Entwurf (falls explizit gewünscht)
-            create_url = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages"
-            r = requests.post(create_url, headers=headers, json={"isDraft": True}, timeout=20)
-            r.raise_for_status()
-            draft_id = r.json()["id"]
+        r = requests.post(url_create, headers=headers, timeout=20)
+        r.raise_for_status()
+        draft = r.json()
+        draft_id = draft["id"]
 
-        # 2) Body setzen (HTML)
+        # 2) Body setzen (HTML) und – falls nötig – Empfänger absichern
+        patch: Dict[str, Any] = {"body": {"contentType": "HTML", "content": html_body}}
+
+        # Bei einfachem Reply sicherstellen, dass der Absender im To steht
+        if mode == "reply" and orig_from:
+            patch["toRecipients"] = [{"emailAddress": orig_from}]
+        # Bei reply_all NICHT überschreiben (Graph füllt To/Cc korrekt); nur Body patchen
+
         url_patch = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{draft_id}"
-        patch = {"body": {"contentType": "HTML", "content": html_body}}
         r2 = requests.patch(url_patch, headers=headers, json=patch, timeout=20)
         r2.raise_for_status()
         return draft_id
