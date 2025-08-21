@@ -1,6 +1,6 @@
-# graph.py
+# graph.py — Overkill Email Drafts
 from __future__ import annotations
-import os
+import os, time, random, re
 import datetime as dt
 from typing import TypedDict, List, Optional, Dict, Any
 from pathlib import Path
@@ -24,18 +24,27 @@ CLIENT_SECRET = os.environ["MS_CLIENT_SECRET"]   # Client secret
 SHARED_MAILBOX = os.environ["MS_SHARED_MAILBOX"] # z.B. "friends@zenbivy.eu"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
+# --- Modell/Token-Config (OVERKILL) ---
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+# Default: Sonnet 3.7 (größtes Output-Limit) + 128k-Beta aktiv
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-7-sonnet-latest")
+ANTHROPIC_MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", "90000"))  # groß, aber unter 128k
+ANTHROPIC_OUTPUT_128K = os.getenv("ANTHROPIC_OUTPUT_128K", "1") == "1"
+ANTHROPIC_FALLBACK_MODEL = os.getenv("ANTHROPIC_FALLBACK_MODEL", "claude-sonnet-4-20250514")
+# Multi-Entwurf + Auswahl (Self-critique)
+ANTHROPIC_N_CANDIDATES = int(os.getenv("ANTHROPIC_N_CANDIDATES", "2"))   # 2–3 ist sinnvoll
+CRITIQUE_STRICT = os.getenv("CRITIQUE_STRICT", "1") == "1"
 
 # Wie weit zurück (in Minuten) E-Mails geholt werden sollen
 LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "5"))
 
-# System-Prompt (neutral für Draft-Erstellung & Chat)
+# System-Prompt für beide Graphen
 SYSTEM = (
     "Du bist sleepingbagREBEL, ein präziser, netter Mitarbeiter von Zenbivy. "
-    "Antworte in der Sprache der Eingabe, kurz und konkret. "
+    "Antworte in der Sprache der Eingabe, kurz, konkret und korrekt. "
     "Nutze nur die gelieferten Informationen bzw. Tools. "
-    "Du kannst mit den Tools an hilfreiche Informationen kommen. "
+    "Wenn Informationen fehlen, stelle gezielte, knappe Rückfragen. "
+    "Rendere Antworten als sauberes HTML ohne <html>/<head>/<body>-Wrapper."
 )
 
 # =========================
@@ -118,21 +127,61 @@ _TOOL_MAP = {t.name: t for t in TOOLS}
 # =========================
 # ========= LLM ===========
 # =========================
+_extra_headers = {}
+if ANTHROPIC_OUTPUT_128K:
+    _extra_headers["anthropic-beta"] = "output-128k-2025-02-19"
+
 llm = ChatAnthropic(
     model=ANTHROPIC_MODEL,
     api_key=ANTHROPIC_API_KEY,
     temperature=0.2,
-    max_tokens=65000,
+    max_tokens=ANTHROPIC_MAX_TOKENS,
+    extra_headers=_extra_headers or None,
 )
 llm_with_tools = llm.bind_tools(TOOLS)
 
+
+def _is_retryable_error(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return any(k in s for k in [
+        "overloaded", "rate_limit", "timeout", "temporarily", "unavailable",
+        "gateway", "service unavailable", "529", "429", "502", "503", "504"
+    ])
+
+
+def _invoke_with_retry(_llm, msgs, attempts: int = 7, base: float = 0.6, cap: float = 30.0):
+    for i in range(attempts):
+        try:
+            return _llm.invoke(msgs, config=RunnableConfig())
+        except Exception as e:
+            if i == attempts - 1 or not _is_retryable_error(e):
+                raise
+            sleep_s = min(cap, base * (2 ** i)) + random.uniform(0, 0.6)
+            time.sleep(sleep_s)
+
+
+def _try_invoke_with_fallback(msgs):
+    try:
+        return _invoke_with_retry(llm_with_tools, msgs)
+    except Exception as e:
+        if _is_retryable_error(e):
+            alt_llm = ChatAnthropic(
+                model=ANTHROPIC_FALLBACK_MODEL,
+                api_key=ANTHROPIC_API_KEY,
+                temperature=0.2,
+                max_tokens=min(ANTHROPIC_MAX_TOKENS, 64000),
+            ).bind_tools(TOOLS)
+            return _invoke_with_retry(alt_llm, msgs)
+        raise
+
+
 def run_agent_with_tools(user_text: str) -> str:
     """
-    Einmalige Tool-Schleife für einfache Prompts -> Textantwort.
+    Eine Tool-Schleife für einfache Prompts -> Textantwort (max. 3 Tool-Runden).
     """
     msgs: List[Any] = [SystemMessage(content=SYSTEM), HumanMessage(content=user_text)]
-    for _ in range(3):  # bis zu 3 Tool-Runden
-        ai: AIMessage = llm_with_tools.invoke(msgs, config=RunnableConfig())
+    for _ in range(3):
+        ai: AIMessage = _try_invoke_with_fallback(msgs)
         msgs.append(ai)
         tool_calls = getattr(ai, "tool_calls", None) or []
         if not tool_calls:
@@ -151,6 +200,76 @@ def run_agent_with_tools(user_text: str) -> str:
             msgs.append(ToolMessage(content=str(res), name=name, tool_call_id=call.get("id")))
     return "Ich konnte die Anfrage nicht abschließen. Bitte schreibe an friends@zenbivy.eu."
 
+
+# ==============
+# === QUALITY ===
+# ==============
+_SANITIZE_TAGS_RE = re.compile(r"<(script|style|iframe|link|meta|object|embed)[\s\S]*?>[\s\S]*?</\\1>", re.IGNORECASE)
+_ON_EVENT_ATTR_RE = re.compile(r"\son[a-z]+=\"[^\"]*\"", re.IGNORECASE)
+_JS_URL_RE = re.compile(r"(javascript:)[^\"']*", re.IGNORECASE)
+
+
+def _sanitize_email_html(html: str) -> str:
+    if not html:
+        return html
+    # Entferne gefährliche Tags (block)
+    html = _SANITIZE_TAGS_RE.sub("", html)
+    # Entferne on* Handler
+    html = _ON_EVENT_ATTR_RE.sub("", html)
+    # Entferne javascript: URLs
+    html = _JS_URL_RE.sub("", html)
+    # Trim
+    return html.strip()
+
+
+def _candidate_prompt(body_html: str, variant_id: int) -> str:
+    return (
+        "Erstelle eine höfliche, hilfreiche und konkrete Antwort als sauberes HTML (ohne <html>/<head>/<body>). "
+        "Schließe mit ‘— sleepingbagREBEL’. "
+        "Antworte ausschließlich basierend auf folgendem E-Mail-Body. "
+        "Wenn Informationen fehlen, stelle am Ende maximal 3 prägnante Rückfragen als <ul>. "
+        "Achte auf: korrekte Sprache (automatisch erkennen), klare Struktur (<p>, <ul>, <ol>, <strong>), "
+        "präzise Produkthinweise. Nutze Links auf Zenbivy-Seiten nur, wenn sie explizit im Tool 'gear_guide' vorkommen. "
+        "Gib ausschließlich den E-Mail-Body (HTML) zurück, keine Erklärungen.\n\n"
+        "EMAIL_BODY_HTML_START\n"
+        f"{body_html}\n"
+        "EMAIL_BODY_HTML_END\n\n"
+        f"VARIANT: {variant_id}"
+    )
+
+
+def _critique_prompt(candidates: List[str], body_html: str) -> str:
+    rubric = (
+        "Bewerte die Kandidaten nach: (1) Korrektheit/Bezug zum Body, (2) Vollständigkeit, (3) Klarheit/Struktur, "
+        "(4) Ton/Markenstimme, (5) Sprachqualität. Korrigiere Mängel. Gib NUR das finale, verbessertes HTML zurück "
+        "(ohne <html>/<head>/<body>), mit Abschluss ‘— sleepingbagREBEL’. Keine Kommentare/Erklärungen."
+    )
+    joined = "\n\n".join([f"CANDIDATE_{i+1}_START\n{c}\nCANDIDATE_{i+1}_END" for i, c in enumerate(candidates)])
+    return (
+        f"{rubric}\n\nEMAIL_BODY_HTML_START\n{body_html}\nEMAIL_BODY_HTML_END\n\n{joined}"
+    )
+
+
+def generate_overkill_reply(body_html: str) -> str:
+    # 1) Kandidaten erstellen
+    n = max(1, min(ANTHROPIC_N_CANDIDATES, 5))
+    candidates: List[str] = []
+    for i in range(n):
+        user_text = _candidate_prompt(body_html, i + 1)
+        cand_html = run_agent_with_tools(user_text).strip()
+        candidates.append(cand_html)
+
+    final_html = candidates[-1]
+
+    # 2) Kritische Auswahl/Politur (zweiter Pass)
+    if n > 1 or CRITIQUE_STRICT:
+        critique_text = _critique_prompt(candidates, body_html)
+        final_html = run_agent_with_tools(critique_text).strip() or final_html
+
+    # 3) Sanitize
+    return _sanitize_email_html(final_html)
+
+
 # =========================
 # ==== MS GRAPH CLIENT ====
 # =========================
@@ -168,10 +287,6 @@ class GraphClient:
         return res["access_token"]
 
     def list_messages_since(self, since_iso: str, max_count: int = 50) -> List[Dict[str, Any]]:
-        """
-        Holt Mails aus der Inbox der Shared Mailbox mit Filter receivedDateTime >= since_iso.
-        since_iso muss z.B. '2025-08-20T09:10:00Z' sein (UTC).
-        """
         at = self.token()
         headers = {"Authorization": f"Bearer {at}"}
         params = {
@@ -187,9 +302,6 @@ class GraphClient:
         return data.get("value", [])
 
     def get_message_body(self, msg_id: str) -> str:
-        """
-        Liefert den RAW-Body (häufig HTML) der E-Mail.
-        """
         at = self.token()
         headers = {"Authorization": f"Bearer {at}"}
         url = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{msg_id}?$select=body"
@@ -199,10 +311,6 @@ class GraphClient:
         return body.get("content", "") or ""
 
     def create_reply_draft(self, original_id: str, html_body: str) -> str:
-        """
-        Erzeugt einen Antwort-ENTWURF zu einer bestehenden Nachricht.
-        Gibt die Draft-ID zurück. NICHT senden.
-        """
         at = self.token()
         headers = {"Authorization": f"Bearer {at}", "Content-Type": "application/json"}
 
@@ -223,28 +331,22 @@ class GraphClient:
 # =========================
 # ======= HELPERS =========
 # =========================
+
 def utc_iso_now_minus_minutes(minutes: int) -> str:
-    """
-    Gibt eine UTC-ISO8601 Zeit mit Z-Suffix zurück, z.B. '2025-08-20T09:10:00Z'
-    """
     return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 # =========================
 # ====== AUTODRAFT GRAPH ==
 # =========================
 class AppState(TypedDict, total=False):
-    # für LangGraph
     messages: List[Any]
-    # eigene Felder
     lookback_iso: str
     new_emails: List[Dict[str, Any]]
     drafted_count: int
     drafted_ids: List[str]
 
+
 def node_fetch_recent_emails(state: AppState) -> AppState:
-    """
-    Holt E-Mails der letzten LOOKBACK_MINUTES Minuten (nur IDs und Timestamps).
-    """
     client = GraphClient()
     since_iso = utc_iso_now_minus_minutes(LOOKBACK_MINUTES)
     msgs = client.list_messages_since(since_iso=since_iso, max_count=50)
@@ -253,37 +355,19 @@ def node_fetch_recent_emails(state: AppState) -> AppState:
         "new_emails": msgs,
     }
 
+
 def node_generate_drafts_body_only(state: AppState) -> AppState:
-    """
-    Lädt für jede Nachricht den tatsächlichen Body (RAW, zumeist HTML) und
-    erstellt auf Basis *ausschließlich dieses Bodys* eine kurze HTML-Antwort.
-    Speichert die Antwort als Draft.
-    """
     client = GraphClient()
     drafted = 0
     draft_ids: List[str] = []
 
     for m in state.get("new_emails", []):
         msg_id = m["id"]
-
-        # 1) Original-Body (RAW; häufig HTML) holen
         body_html = client.get_message_body(msg_id)
 
-        # 2) LLM nur mit E-Mail-Body füttern
-        user_text = (
-            "Erstelle eine höfliche, hilfreiche und konkrete Antwort als HTML unterschreibe mit sleepingbagREBEL."
-            "Antworte ausschließlich basierend auf folgendem E-Mail-Body. "
-            "Gib ausschließlich den email body zurück"
-            "Gib nur den Email Body zurück"
-            "Antworte in der Sprache des folgenden Inhalts.\n\n"
-            "EMAIL_BODY_HTML_START\n"
-            f"{body_html}\n"
-            "EMAIL_BODY_HTML_END"
-        )
+        # OVERKILL: mehrere Kandidaten -> beste Version -> Sanitizer
+        reply_html = generate_overkill_reply(body_html)
 
-        reply_html = run_agent_with_tools(user_text).strip()
-
-        # 3) Draft im Shared Mailbox erstellen
         try:
             draft_id = client.create_reply_draft(original_id=msg_id, html_body=reply_html)
             drafted += 1
@@ -292,6 +376,7 @@ def node_generate_drafts_body_only(state: AppState) -> AppState:
             draft_ids.append(f"[Draft-Fehler für {msg_id}: {e}]")
 
     return {"drafted_count": drafted, "drafted_ids": draft_ids}
+
 
 def node_summarize(state: AppState) -> AppState:
     drafted = state.get("drafted_count", 0)
@@ -323,12 +408,10 @@ graph_autodraft = builder_autodraft.compile()
 # =================================
 # ====== CHAT GRAPH (CONVERSATION)
 # =================================
+
 def call_model(state: MessagesState) -> Dict[str, Any]:
-    """
-    Fügt den System-Prompt voran und ruft das Modell (mit Tools) auf.
-    """
     msgs = [SystemMessage(content=SYSTEM)] + state["messages"]
-    ai = llm_with_tools.invoke(msgs, config=RunnableConfig())
+    ai = _try_invoke_with_fallback(msgs)
     return {"messages": [ai]}
 
 # Tool-Knoten für automatische Toolausführung
@@ -340,10 +423,9 @@ builder_chat.add_node("call_model", call_model)
 builder_chat.add_node("tools", tool_node)
 
 builder_chat.add_edge(START, "call_model")
-# Wenn das Modell Tools anfordert -> Tools ausführen, dann zurück zum Modell
 builder_chat.add_conditional_edges(
     "call_model",
-    tools_condition,  # entscheidet anhand von tool_calls
+    tools_condition,
     {
         "tools": "tools",
         END: END,
@@ -356,11 +438,5 @@ graph_chat = builder_chat.compile()
 # =================================
 # ===== Default-Export (optional) ==
 # =================================
-# Für bestehende Deployments kann 'graph' auf den Autodraft-Graph zeigen.
+# Für bestehende Deployments zeigt der Default auf Autodraft
 graph = graph_autodraft
-
-
-
-
-
-
