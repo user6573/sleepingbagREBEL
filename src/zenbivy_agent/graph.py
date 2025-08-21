@@ -240,29 +240,59 @@ class GraphClient:
         body = r.json().get("body", {})
         return body.get("content", "") or ""
 
-    def create_reply_draft(self, original_id: str, html_body: str) -> str:
-        """
-        Erzeugt einen Antwort-ENTWURF zu einer bestehenden Nachricht.
-        Gibt die Draft-ID zurück. NICHT senden.
-        """
-        at = self.token()
-        headers = {"Authorization": f"Bearer {at}", "Content-Type": "application/json"}
+   def create_reply_draft(self, original_id: str, html_body: str, reply_all: bool = False) -> str:
+    """
+    Erzeugt einen Antwort-ENTWURF (optional "Antwort an alle") zu einer bestehenden Nachricht
+    und lässt den bisherigen Verlauf sichtbar. Gibt die Draft-ID zurück. NICHT senden.
 
-        # 1) Reply-Entwurf anlegen
-        url_create = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}/createReply"
-        r = requests.post(url_create, headers=headers, timeout=20)
-        r.raise_for_status()
-        draft = r.json()
-        draft_id = draft["id"]
+    - Wir erstellen zuerst den Reply-Draft via createReply/All.
+    - Dann laden wir den aktuellen Draft-Body (der bei vielen Tenants bereits den Verlauf enthält).
+    - Falls leer, quoten wir den Original-Mail-Body manuell in einem Block.
+    - Anschließend patchen wir den Draft so, dass deine Antwort OBEN steht und der Verlauf darunter sichtbar bleibt.
+    """
+    at = self.token()
+    headers = {"Authorization": f"Bearer {at}", "Content-Type": "application/json"}
 
-        # 2) Body setzen (HTML)
-        url_patch = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{draft_id}"
-        patch = {"body": {"contentType": "HTML", "content": html_body}}
-        r2 = requests.patch(url_patch, headers=headers, json=patch, timeout=20)
-        r2.raise_for_status()
-        return draft_id
+    # 1) Reply-Entwurf anlegen (Reply oder Reply-All)
+    action = "createReplyAll" if reply_all else "createReply"
+    url_create = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}/{action}"
+    r = requests.post(url_create, headers=headers, timeout=20)
+    r.raise_for_status()
+    draft = r.json()
+    draft_id = draft["id"]
 
-# =========================
+    # 2) Vorhandenen Draft-Body laden (häufig enthält dieser bereits den zitierten Verlauf)
+    draft_body_html = ""
+    try:
+        url_get = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{draft_id}?$select=body"
+        r_get = requests.get(url_get, headers={"Authorization": f"Bearer {at}"}, timeout=20)
+        r_get.raise_for_status()
+        draft_body_html = (r_get.json().get("body", {}) or {}).get("content", "") or ""
+    except Exception:
+        draft_body_html = ""
+
+    # 3) Fallback: Wenn kein Verlauf im Draft-Body ist, Original-Mail-Body manuell quoten
+    if not draft_body_html:
+        try:
+            original_html = self.get_message_body(original_id)
+            draft_body_html = (
+                "<div style='margin-top:12px; border-left:2px solid #ddd; padding-left:12px;'>"
+                f"{original_html}"
+                "</div>"
+            )
+        except Exception:
+            draft_body_html = ""
+
+    # 4) Deine Antwort oben, Verlauf darunter
+    combined_html = f"{html_body}\n<br><br>\n{draft_body_html}" if draft_body_html else html_body
+
+    # 5) Draft-Body setzen
+    url_patch = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{draft_id}"
+    patch = {"body": {"contentType": "HTML", "content": combined_html}}
+    r2 = requests.patch(url_patch, headers=headers, json=patch, timeout=20)
+    r2.raise_for_status()
+    return draft_id
+
 # ======= HELPERS =========
 # =========================
 def utc_iso_now_minus_minutes(minutes: int) -> str:
@@ -399,3 +429,4 @@ graph_chat = builder_chat.compile()
 # ===== Default-Export (optional) ==
 # =================================
 graph = graph_autodraft
+
