@@ -69,6 +69,17 @@ SYSTEM = (
     "\n"
     "Wenn du Webseiten nutzt, integriere relevante Bildinformationen (Alt-Text, Bildunterschrift) inhaltlich in deine Antwort, aber füge keine großen HTML-Blöcke ein."
 )
+# =========================
+# == Outlook Autodraft ENV
+# =========================
+MS_TENANT_ID = os.environ["MS_TENANT_ID"]            # Azure AD Tenant ID
+MS_CLIENT_ID = os.environ["MS_CLIENT_ID"]            # App (client) ID
+MS_CLIENT_SECRET = os.environ["MS_CLIENT_SECRET"]    # Client secret
+MS_SHARED_MAILBOX = os.environ["MS_SHARED_MAILBOX"]  # z.B. "friends@zenbivy.eu"
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+# Wie weit zurück (in Minuten) neue E-Mails geprüft werden sollen
+LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "5"))
 
 # =========================
 # ====== PFAD/DATEIEN =====
@@ -643,6 +654,87 @@ def _build_context(docs: List[str], metas: List[Dict[str,Any]], max_chars: int =
         })
     return "\n\n".join(parts), refs, items
 
+# =========================
+# ==== MS GRAPH CLIENT ====
+# =========================
+class GraphClient:
+    def __init__(self):
+        if ConfidentialClientApplication is None:
+            raise RuntimeError("msal ist nicht installiert. Bitte `pip install msal` ausführen.")
+        self.app = ConfidentialClientApplication(
+            MS_CLIENT_ID,
+            authority=f"https://login.microsoftonline.com/{MS_TENANT_ID}",
+            client_credential=MS_CLIENT_SECRET,
+        )
+
+    def token(self) -> str:
+        res = self.app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+        if "access_token" not in res:
+            raise RuntimeError(f"Tokenfehler: {res.get('error_description')}")
+        return res["access_token"]
+
+    def _auth_headers(self, prefer_html: bool = False) -> Dict[str, str]:
+        h = {"Authorization": f"Bearer {self.token()}"}
+        if prefer_html:
+            h["Prefer"] = 'outlook.body-content-type="html"'
+        return h
+
+    def list_messages_since(self, since_iso: str, max_count: int = 50) -> List[Dict[str, Any]]:
+        """Neu eingegangene Mails seit since_iso (UTC) aus der Inbox der Shared Mailbox."""
+        headers = self._auth_headers()
+        params = {
+            "$top": str(max_count),
+            "$select": "id,receivedDateTime,subject,from",
+            "$orderby": "receivedDateTime desc",
+            "$filter": f"receivedDateTime ge {since_iso}",
+        }
+        url = f"{GRAPH_BASE}/users/{MS_SHARED_MAILBOX}/mailFolders/Inbox/messages"
+        r = requests.get(url, headers=headers, params=params, timeout=20)
+        r.raise_for_status()
+        return r.json().get("value", [])
+
+    def get_message_core(self, msg_id: str) -> Dict[str, Any]:
+        """Details inkl. HTML-Body (für Antwort-Generierung)."""
+        headers = self._auth_headers(prefer_html=True)
+        url = f"{GRAPH_BASE}/users/{MS_SHARED_MAILBOX}/messages/{msg_id}"
+        params = {"$select": "id,subject,from,sentDateTime,receivedDateTime,body"}
+        r = requests.get(url, headers=headers, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        body = data.get("body", {}) or {}
+        return {
+            "id": data.get("id"),
+            "subject": data.get("subject") or "",
+            "from": ((data.get("from") or {}).get("emailAddress") or {}).get("name") or "",
+            "from_addr": ((data.get("from") or {}).get("emailAddress") or {}).get("address") or "",
+            "sentDateTime": data.get("sentDateTime"),
+            "receivedDateTime": data.get("receivedDateTime"),
+            "body_html": body.get("content", "") or "",
+        }
+
+    def create_reply_draft(self, original_id: str, html_body: str) -> str:
+        """
+        1) POST createReply -> neuen Antwort-Entwurf im Thread anlegen
+        2) PATCH Body (HTML) setzen
+        """
+        headers = self._auth_headers()
+        headers["Content-Type"] = "application/json"
+
+        # 1) createReply
+        url_create = f"{GRAPH_BASE}/users/{MS_SHARED_MAILBOX}/messages/{original_id}/createReply"
+        r = requests.post(url_create, headers=headers, timeout=20)
+        r.raise_for_status()
+        draft = r.json()
+        draft_id = draft["id"]
+
+        # 2) Body setzen
+        url_patch = f"{GRAPH_BASE}/users/{MS_SHARED_MAILBOX}/messages/{draft_id}"
+        patch = {"body": {"contentType": "HTML", "content": html_body}}
+        r2 = requests.patch(url_patch, headers=headers, json=patch, timeout=20)
+        r2.raise_for_status()
+        return draft_id
+
+
 @tool("rag")
 def rag(query: str, top_k: int = 5) -> dict:
     """
@@ -740,6 +832,99 @@ def agent_node(state: State, config: RunnableConfig):
 
 tool_node = ToolNode(TOOLS)
 
+# =========================
+# ====== AUTODRAFT GRAPH ==
+# =========================
+class AutoState(TypedDict, total=False):
+    messages: List[Any]            # optional für LangGraph-Kompatibilität
+    lookback_iso: str
+    new_emails: List[Dict[str, Any]]
+    drafted_count: int
+    drafted_ids: List[str]
+
+def node_fetch_recent_emails(state: AutoState) -> AutoState:
+    client = GraphClient()
+    since_iso = utc_iso_now_minus_minutes(LOOKBACK_MINUTES)
+    msgs = client.list_messages_since(since_iso=since_iso, max_count=50)
+    return {"lookback_iso": since_iso, "new_emails": msgs}
+
+def node_generate_drafts(state: AutoState) -> AutoState:
+    client = GraphClient()
+    drafted = 0
+    draft_ids: List[str] = []
+
+    for m in state.get("new_emails", []):
+        msg_id = m["id"]
+
+        # Original inkl. HTML-Body
+        core = client.get_message_core(msg_id)
+        body_html = core["body_html"] or "<div>(Kein Inhalt erkannt)</div>"
+        from_name = core["from"]
+        sent_iso = core["sentDateTime"]
+        subject = core["subject"]
+
+        # LLM nur mit E-Mail-Body füttern → NUR HTML-Antwortkörper zurückgeben
+        user_text = (
+            "Erstelle eine höfliche, hilfreiche, konkrete Antwort als HTML und unterschreibe mit 'sleepingbagREBEL'. "
+            "Antworte ausschließlich basierend auf folgendem E-Mail-Body. "
+            "Gib NUR den Email-Body der Antwort zurück (keinen Betreff, keine Meta-Zeilen, kein Codeblock). "
+            "Antworte in der Sprache des folgenden Inhalts.\n\n"
+            "EMAIL_BODY_HTML_START\n"
+            f"{body_html}\n"
+            "EMAIL_BODY_HTML_END"
+        )
+        # Du hast bereits llm_with_tools / Guards etc. im Chat-Graph – wir rufen hier direkt dein Modell:
+        ai = llm_with_tools.invoke([SystemMessage(content=SYSTEM), HumanMessage(content=user_text)], config=RunnableConfig())
+        reply_html = sanitize_llm_html(getattr(ai, "content", "") or "")
+
+        if not reply_html:
+            reply_html = (
+                "<p>Vielen Dank für Ihre Nachricht! "
+                "Wir prüfen Ihr Anliegen und melden uns in Kürze.</p>"
+                "<p>Beste Grüße<br>sleepingbagREBEL</p>"
+            )
+
+        combined_html = build_reply_with_history(
+            reply_html=reply_html,
+            original_html=body_html,
+            from_name=from_name,
+            sent_iso=sent_iso,
+            subject=subject,
+        )
+
+        try:
+            draft_id = client.create_reply_draft(original_id=msg_id, html_body=combined_html)
+            drafted += 1
+            draft_ids.append(draft_id)
+        except Exception as e:
+            draft_ids.append(f"[Draft-Fehler für {msg_id}: {e}]")
+
+    return {"drafted_count": drafted, "drafted_ids": draft_ids}
+
+def node_summarize(state: AutoState) -> AutoState:
+    drafted = state.get("drafted_count", 0)
+    ids = state.get("drafted_ids", [])
+    lookback = state.get("lookback_iso", "")
+    lines = [f"Zeitraum: seit {lookback}", f"Erstellte Entwürfe: {drafted}"]
+    if ids:
+        lines.append("Draft-IDs / Meldungen:")
+        lines.extend(f"- {x}" for x in ids)
+    return {"messages": [AIMessage(content="\n".join(lines))]}
+
+# Graph bauen (Autodraft)
+builder_autodraft = StateGraph(AutoState)
+builder_autodraft.add_node("fetch_recent_emails", node_fetch_recent_emails)
+builder_autodraft.add_node("generate_drafts", node_generate_drafts)
+builder_autodraft.add_node("summarize", node_summarize)
+
+builder_autodraft.add_edge(START, "fetch_recent_emails")
+builder_autodraft.add_edge("fetch_recent_emails", "generate_drafts")
+builder_autodraft.add_edge("generate_drafts", "summarize")
+builder_autodraft.add_edge("summarize", END)
+
+graph_autodraft = builder_autodraft.compile()
+
+
 builder = StateGraph(State)
 builder.add_node("agent", agent_node)
 builder.add_node("tools", tool_node)
@@ -753,6 +938,20 @@ graph = builder.compile(checkpointer=checkpointer)
 
 # Alias für Cloud-Configs, die 'graph_chat' erwarten
 graph_chat = graph
+
+# =========================
+# == Export / Auswahl
+# =========================
+# Standard: Chat-Graph bleibt erhalten
+graph_chat = graph
+
+# Optional: Autodraft als Default für Cron (über ENV steuerbar)
+RUN_MODE = os.getenv("RUN_MODE", "chat").lower()  # "chat" oder "autodraft"
+if RUN_MODE == "autodraft":
+    graph = graph_autodraft
+else:
+    graph = graph_chat
+
 
 if __name__ == "__main__":
     thread = {"configurable": {"thread_id": str(uuid.uuid4())}}
@@ -771,3 +970,4 @@ if __name__ == "__main__":
     q2 = {"role":"user","content":"Nutze 'bedingungen' und sag mir, wie der Versand läuft"}
     out2 = graph.invoke({"messages":[q2]}, config=thread)
     print("ASSISTANT (Bedingungen):", out2["messages"][-1].content[:800] if out2["messages"] else "<no reply>")
+
