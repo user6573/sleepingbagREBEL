@@ -26,3 +26,15 @@ tavily-python>=0.4.0
 # optional nur falls du OpenAI-Embeddings nutzt
 openai>=1.40.0
 
+
+msal>=1.29.0
+requests>=2.32.0
+beautifulsoup4>=4.12.3
+langgraph
+langchain-core
+langchain-anthropic
+chromadb
+sentence-transformers
+rank-bm25
+tavily-python
+python-dotenv
