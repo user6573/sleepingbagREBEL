@@ -355,9 +355,41 @@ def bedingungen(kategorie: PolicyKey) -> str:
         "Rückgabe- & Umtauschbedingungen": (
             """             
                 Rückgabe- und Umtauschanweisungen
-                ...
-                Kundenservice: friends@zenbivy.eu
-                Rücksendeadresse: Koch alpin GmbH
+                
+                Allgemeine Bedingungen:
+                - Rückgabe innerhalb von 14 Tagen nach Lieferung möglich
+                - Vollständige Rückerstattung des Kaufpreises inkl. ursprünglicher Versandkosten
+                - Größe und Komfort können zu Hause getestet werden
+                
+                Voraussetzungen für Rückgabe:
+                - Artikel muss unbenutzt sein
+                - In Originalverpackung zurücksenden (Ausnahme: Matten)
+                - Im gleichen Zustand wie bei Erhalt (inkl. aller Etiketten und Labels)
+                - Ausgefülltes Rücksendeformular beilegen
+                - Artikel dürfen nicht schmutzig oder mit Tierhaaren bedeckt sein
+                
+                Strafabzüge bei nicht ordnungsgemäßer Rückgabe:
+                - Fehlendes Etikett: 10€ Abzug
+                - Fehlendes eingenähtes Label (Law Tag): 50% Abzug
+                
+                Umtauschprozess:
+                1. Neue Bestellung für gewünschten Artikel aufgeben
+                2. Ursprünglichen Artikel zur Rückerstattung zurücksenden
+                Hinweis: Beide Bestellungen werden temporär belastet
+                
+                Bearbeitungszeiten:
+                - Rücksendebearbeitung: 3-6 Werktage (max. 2 Wochen)
+                - Rückerstattung: automatisch innerhalb 10 Werktagen auf ursprüngliche Zahlungsmethode
+                
+                Rücksendekosten und Verantwortung:
+                - Kunde trägt Rücksendekosten
+                - Empfehlung: Versand mit Sendungsverfolgung verwenden
+                - Zenbivy haftet nicht für verlorene oder beschädigte Pakete
+                - Keine Rücksendenummer ausstellbar
+                
+                Kontakt und Adresse:
+                - Kundenservice: friends@zenbivy.eu
+                - Rücksendeadresse: Koch alpin GmbH
                                    Dr-Franz-Werner-Str.13
                                    A-6020 Innsbruck
                                    Tyrol, Austria, EU
@@ -366,7 +398,30 @@ def bedingungen(kategorie: PolicyKey) -> str:
         "Versandbedingungen": (
             """
             Versandbedingungen
-            ...
+            
+            Lieferungen nach: Österreich, Belgien, Tschechien, Dänemark, Finnland, Frankreich, 
+            Deutschland, Irland, Italien, Niederlande, Polen, Portugal, Spanien, Schweden, 
+            Schweiz, Bulgarien, Kroatien, Zypern, Estland, Griechenland, Ungarn, Lettland, 
+            Litauen, Luxemburg, Malta, Rumänien, Slowakei, Slowenien - ausgenommen Überseegebiete.
+            
+            EU-Versand:
+            - Lieferung mit DPD
+            - Lieferzeit: 2 Tage (Österreich, Deutschland), bis zu 1 Woche (andere EU-Länder)
+            - Versandkosten: EUR 20,00 für Bestellungen bis EUR 300,00
+            - Kostenloser Versand für Bestellungen über EUR 300,00
+            - Ausnahme Zypern/Malta: Lieferung mit TNT für pauschal EUR 80,00
+            
+            Kleinbestellungen (bis EUR 150,00):
+            - Nach Deutschland und Österreich: nur EUR 6,00 Versandkosten
+            
+            Nicht-EU-Länder:
+            - Lieferung durch Post.at
+            - Lieferzeit: bis zu 1 Woche
+            - Preise ohne 20% Umsatzsteuer ausgewiesen
+            - Einfuhrumsatzsteuer und Zollgebühren bei Zustellung zu bezahlen
+            - Versandkosten:
+              * Schweiz: EUR 26,00
+              * UK, Island, Norwegen und andere Staaten: EUR 60,00
             """
         ),
         "Rabattcode": "Man kann einen Rabattcode im Newsletter finden",
