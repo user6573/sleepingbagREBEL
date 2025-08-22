@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import uuid, os, re, json
+import uuid, os, re, json, time, random, datetime as dt
 from typing import Annotated, Literal, List, Dict, Any, Optional, Tuple
 from typing_extensions import TypedDict
 
@@ -15,7 +15,7 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.memory import InMemorySaver
 
-# LLM (Claude)
+# LLM (Claude via Anthropic)
 from langchain_anthropic import ChatAnthropic
 
 # --- RAG-Dependencies ---
@@ -376,88 +376,6 @@ def gear_guide(name: GuideKey) -> dict:
 
 @tool("bedingungen")
 def bedingungen(kategorie: PolicyKey) -> str:
-    """
-    [Aktiv nutzen] Shop-Bedingungen kompakt:
-      - 'Rabattcode'  → wie erhalten?
-      - 'Rückgabe- & Umtauschbedingungen' → Fristen/Voraussetzungen
-      - 'Versandbedingungen' → Länder/Laufzeiten
-    Nutze dieses Tool proaktiv bei allen Politik-/Bedingungsfragen.
-    """
-    POLICIES = {
-        "Rückgabe- & Umtauschbedingungen": (
-            """             
-                Rückgabe- und Umtauschanweisungen
-                
-                Allgemeine Bedingungen:
-                - Rückgabe innerhalb von 14 Tagen nach Lieferung möglich
-                - Vollständige Rückerstattung des Kaufpreises inkl. ursprünglicher Versandkosten
-                - Größe und Komfort können zu Hause getestet werden
-                
-                Voraussetzungen für Rückgabe:
-                - Artikel muss unbenutzt sein
-                - In Originalverpackung zurücksenden (Ausnahme: Matten)
-                - Im gleichen Zustand wie bei Erhalt (inkl. aller Etiketten und Labels)
-                - Ausgefülltes Rücksendeformular beilegen
-                - Artikel dürfen nicht schmutzig oder mit Tierhaaren bedeckt sein
-                
-                Strafabzüge bei nicht ordnungsgemäßer Rückgabe:
-                - Fehlendes Etikett: 10€ Abzug
-                - Fehlendes eingenähtes Label (Law Tag): 50% Abzug
-                
-                Umtauschprozess:
-                1. Neue Bestellung für gewünschten Artikel aufgeben
-                2. Ursprünglichen Artikel zur Rückerstattung zurücksenden
-                Hinweis: Beide Bestellungen werden temporär belastet
-                
-                Bearbeitungszeiten:
-                - Rücksendebearbeitung: 3-6 Werktage (max. 2 Wochen)
-                - Rückerstattung: automatisch innerhalb 10 Werktagen auf ursprüngliche Zahlungsmethode
-                
-                Rücksendekosten und Verantwortung:
-                - Kunde trägt Rücksendekosten
-                - Empfehlung: Versand mit Sendungsverfolgung verwenden
-                - Zenbivy haftet nicht für verlorene oder beschädigte Pakete
-                - Keine Rücksendenummer ausstellbar
-                
-                Kontakt und Adresse:
-                - Kundenservice: friends@zenbivy.eu
-                - Rücksendeadresse: Koch alpin GmbH
-                                   Dr-Franz-Werner-Str.13
-                                   A-6020 Innsbruck
-                                   Tyrol, Austria, EU
-                """
-        ),
-        "Versandbedingungen": (
-            """
-            Versandbedingungen
-            
-            Lieferungen nach: Österreich, Belgien, Tschechien, Dänemark, Finnland, Frankreich, 
-            Deutschland, Irland, Italien, Niederlande, Polen, Portugal, Spanien, Schweden, 
-            Schweiz, Bulgarien, Kroatien, Zypern, Estland, Griechenland, Ungarn, Lettland, 
-            Litauen, Luxemburg, Malta, Rumänien, Slowakei, Slowenien - ausgenommen Überseegebiete.
-            
-            EU-Versand:
-            - Lieferung mit DPD
-            - Lieferzeit: 2 Tage (Österreich, Deutschland), bis zu 1 Woche (andere EU-Länder)
-            - Versandkosten: EUR 20,00 für Bestellungen bis EUR 300,00
-            - Kostenloser Versand für Bestellungen über EUR 300,00
-            - Ausnahme Zypern/Malta: Lieferung mit TNT für pauschal EUR 80,00
-            
-            Kleinbestellungen (bis EUR 150,00):
-            - Nach Deutschland und Österreich: nur EUR 6,00 Versandkosten
-            
-            Nicht-EU-Länder:
-            - Lieferung durch Post.at
-            - Lieferzeit: bis zu 1 Woche
-            - Preise ohne 20% Umsatzsteuer ausgewiesen
-            - Einfuhrumsatzsteuer und Zollgebühren bei Zustellung zu bezahlen
-            - Versandkosten:
-              * Schweiz: EUR 26,00
-              * UK, Island, Norwegen und andere Staaten: EUR 60,00
-            """
-        ),
-        "Rabattcode": "Man kann einen Rabattcode im Newsletter finden",
-    }
     return POLICIES[kategorie]
 
 @tool("wieder_verfuegbar")
@@ -532,7 +450,7 @@ class _GraphKochClient:
         self.tenant = os.getenv("MS_TENANT_ID")
         self.client_id = os.getenv("MS_CLIENT_ID")
         self.client_secret = os.getenv("MS_CLIENT_SECRET")
-        self.mailbox = os.getenv("MS_SHARED_MAILBOX_KOCH")  # << Shared Mailbox UPN/SMTP
+        self.mailbox = os.getenv("MS_SHARED_MAILBOX_KOCH")  # Shared Mailbox (Versand)
         if not (self.tenant and self.client_id and self.client_secret and self.mailbox):
             raise RuntimeError("Fehlende ENV Variablen: MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET, MS_SHARED_MAILBOX_KOCH")
 
@@ -799,110 +717,417 @@ def rag(query: str, top_k: int = 5) -> dict:
 # =========================
 # ======== LLM BIND =======
 # =========================
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+# Für mögliche Fallback-Nutzung ein alternatives Modell aus ENV laden
+ANTHROPIC_FALLBACK_MODEL = os.getenv("ANTHROPIC_FALLBACK_MODEL")
+
+# Haupt-LLM initialisieren (Claude-Modell)
 llm = ChatAnthropic(
     model=MODEL,
-    temperature=0,
-    max_tokens=50000,
+    api_key=ANTHROPIC_API_KEY,
+    temperature=0.2,
+    max_tokens=8000  # sichere Grenze (kann angepasst werden)
 )
-
 TOOLS = [wieder_verfuegbar, bedingungen, gear_guide, rag, search_web, finde_lieferung]
 llm_with_tools = llm.bind_tools(TOOLS)
+# Hilfs-Mapping für Tool-Nutzung außerhalb des Graphen
+_TOOL_MAP = {t.name: t for t in TOOLS}
 
+# =========================
+# ===== LLM INVOCATION UTILS (mit Tool-Schleife) =====
+# =========================
+def _is_retryable_error(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return any(k in s for k in [
+        "overloaded", "rate_limit", "timeout", "temporarily", "unavailable",
+        "gateway", "service unavailable", "529", "429", "502", "503", "504"
+    ])
+
+def _invoke_with_retry(_llm, msgs, attempts: int = 6, base: float = 0.5, cap: float = 20.0):
+    """
+    Führt den LLM-Aufruf mit Retry-Strategie durch (bei Überlastungs-/Timeout-Fehlern).
+    """
+    for i in range(attempts):
+        try:
+            return _llm.invoke(msgs, config=RunnableConfig())
+        except Exception as e:
+            if i == attempts - 1 or not _is_retryable_error(e):
+                raise
+            sleep_s = min(cap, base * (2 ** i)) + random.uniform(0, 0.5)
+            time.sleep(sleep_s)
+
+def _try_invoke_with_fallback(msgs: List[AnyMessage]):
+    """
+    Versucht den LLM-Aufruf mit Tools und fällt bei Fehler optional auf ein anderes Modell zurück.
+    """
+    try:
+        return _invoke_with_retry(llm_with_tools, msgs)
+    except Exception as e:
+        # Bei bestimmten Fehlern alternativ mit Fallback-Modell probieren (falls definiert)
+        if _is_retryable_error(e) and ANTHROPIC_FALLBACK_MODEL:
+            alt_llm = ChatAnthropic(
+                model=ANTHROPIC_FALLBACK_MODEL,
+                api_key=ANTHROPIC_API_KEY,
+                temperature=0.2,
+                max_tokens=8000
+            ).bind_tools(TOOLS)
+            return _invoke_with_retry(alt_llm, msgs)
+        raise
+
+def run_agent_with_tools(user_text: str) -> str:
+    """
+    Führt eine einmalige Anfrage an das LLM (mit Tools) durch und gibt die AI-Antwort zurück.
+    """
+    msgs: List[AnyMessage] = [SystemMessage(content=SYSTEM), HumanMessage(content=user_text)]
+    for _ in range(3):  # bis zu 3 Tool-Runden
+        ai: AIMessage = _try_invoke_with_fallback(msgs)
+        msgs.append(ai)
+        tool_calls = getattr(ai, "tool_calls", None) or []
+        if not tool_calls:
+            # Keine Tool-Aufrufe mehr -> finale Antwort zurückgeben
+            return (ai.content or "").strip()
+        # Tool-Aufrufe abarbeiten
+        for call in tool_calls:
+            name = call.get("name")
+            args = call.get("args") or {}
+            tool_func = _TOOL_MAP.get(name)
+            if not tool_func:
+                # Unbekanntes Tool
+                msgs.append(ToolMessage(content=f"[FEHLER] Tool '{name}' nicht gefunden.", name=name, tool_call_id=call.get("id")))
+                continue
+            try:
+                res = tool_func.invoke(args)
+            except Exception as e:
+                res = {"error": str(e)}
+            msgs.append(ToolMessage(content=str(res), name=name, tool_call_id=call.get("id")))
+    # Wenn nach 3 Runden keine finale Antwort -> Abbruch
+    return "Ich konnte die Anfrage nicht abschließen."
+
+# =========================
+# ====== EMAIL AUTODRAFT GRAPH =====
+# =========================
+# Zeitraum, aus dem neue E-Mails berücksichtigt werden sollen (in Minuten)
+LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "5"))
+
+class GraphClient:
+    GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+    def __init__(self):
+        if ConfidentialClientApplication is None:
+            raise RuntimeError("msal ist nicht installiert. Bitte 'pip install msal' und erneut versuchen.")
+        self.tenant = os.getenv("MS_TENANT_ID")
+        self.client_id = os.getenv("MS_CLIENT_ID")
+        self.client_secret = os.getenv("MS_CLIENT_SECRET")
+        self.mailbox = os.getenv("MS_SHARED_MAILBOX")  # z.B. "friends@zenbivy.eu"
+        if not (self.tenant and self.client_id and self.client_secret and self.mailbox):
+            raise RuntimeError("Fehlende ENV Variablen: MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET, MS_SHARED_MAILBOX")
+        self.app = ConfidentialClientApplication(
+            self.client_id,
+            authority=f"https://login.microsoftonline.com/{self.tenant}",
+            client_credential=self.client_secret
+        )
+
+    def token(self) -> str:
+        res = self.app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+        if "access_token" not in res:
+            raise RuntimeError(f"Tokenfehler: {res.get('error_description')}")
+        return res["access_token"]
+
+    def _auth_headers(self, prefer_html: bool = False) -> Dict[str, str]:
+        h = {"Authorization": f"Bearer {self.token()}"}
+        if prefer_html:
+            # Bei Bedarf HTML-Inhalt anfordern
+            h["Prefer"] = 'outlook.body-content-type="html"'
+        return h
+
+    def list_messages_since(self, since_iso: str, max_count: int = 50) -> List[Dict[str, Any]]:
+        """
+        Holt E-Mails aus dem Posteingang der Shared Mailbox mit Filter receivedDateTime >= since_iso (UTC).
+        since_iso z.B. '2025-08-20T09:10:00Z'
+        """
+        headers = self._auth_headers()
+        params = {
+            "$top": str(max_count),
+            "$select": "id,receivedDateTime,subject,from",
+            "$orderby": "receivedDateTime desc",
+            "$filter": f"receivedDateTime ge {since_iso}",
+        }
+        url = f"{GRAPH_BASE}/users/{self.mailbox}/mailFolders/Inbox/messages"
+        r = requests.get(url, headers=headers, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("value", [])
+
+    def get_message_core(self, msg_id: str) -> Dict[str, Any]:
+        """
+        Liefert Kernfelder einer Mail inkl. HTML-Body, Absender, Betreff, Datum.
+        """
+        headers = self._auth_headers(prefer_html=True)
+        url = f"{GRAPH_BASE}/users/{self.mailbox}/messages/{msg_id}"
+        params = {
+            "$select": "id,subject,from,sentDateTime,receivedDateTime,body",
+        }
+        r = requests.get(url, headers=headers, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        body = data.get("body", {}) or {}
+        return {
+            "id": data.get("id"),
+            "subject": data.get("subject") or "",
+            "from": ((data.get("from") or {}).get("emailAddress") or {}).get("name") or "",
+            "from_addr": ((data.get("from") or {}).get("emailAddress") or {}).get("address") or "",
+            "sentDateTime": data.get("sentDateTime"),
+            "receivedDateTime": data.get("receivedDateTime"),
+            "body_html": body.get("content", "") or "",
+        }
+
+    def create_reply_draft(self, original_id: str, html_body: str) -> str:
+        """
+        Erzeugt einen Antwort-ENTWURF zu einer bestehenden Nachricht (via createReply),
+        setzt anschließend den finalen HTML-Body und gibt die Draft-ID zurück.
+        """
+        headers = self._auth_headers()
+        headers["Content-Type"] = "application/json"
+        # 1) Reply-Entwurf erzeugen (behält Thread-Header)
+        url_create = f"{GRAPH_BASE}/users/{self.mailbox}/messages/{original_id}/createReply"
+        r = requests.post(url_create, headers=headers, timeout=20)
+        r.raise_for_status()
+        draft = r.json()
+        draft_id = draft["id"]
+        # 2) Body des Entwurfs als HTML setzen
+        url_patch = f"{GRAPH_BASE}/users/{self.mailbox}/messages/{draft_id}"
+        patch = {"body": {"contentType": "HTML", "content": html_body}}
+        r2 = requests.patch(url_patch, headers=headers, json=patch, timeout=20)
+        r2.raise_for_status()
+        return draft_id
+
+def utc_iso_now_minus_minutes(minutes: int) -> str:
+    """
+    Gibt die aktuelle Zeit (UTC) als ISO8601-String mit Z-Suffix zurück, minus `minutes`.
+    """
+    return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _format_dt_for_quote(iso: Optional[str]) -> str:
+    """
+    Formatiert ein ISO-Datum knapp für die Quote-Kopfzeile.
+    Beispiel: '2025-08-21T09:15:00Z' -> '2025-08-21 09:15 UTC'
+    """
+    if not iso:
+        return ""
+    try:
+        d = dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(dt.timezone.utc)
+        return d.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return iso or ""
+
+def build_reply_with_history(reply_html: str, original_html: str,
+                             from_name: str = "", sent_iso: str = "", subject: str = "") -> str:
+    """
+    Baut den finalen Antwort-HTML-Body:
+    - oben: KI-Antwort (HTML)
+    - darunter: Quote-Header + Originalnachricht als Blockquote
+    """
+    # Quote-Header
+    when = _format_dt_for_quote(sent_iso)
+    header_line = ""
+    if when or from_name or subject:
+        header_line = (
+            f'<div style="margin-top:16px;margin-bottom:8px;font-size:12px;color:#555;">'
+            f'----- Original Message -----<br>'
+            f'Von: {from_name or "Unbekannt"}<br>'
+            f'Gesendet: {when or "Unbekannt"}<br>'
+            f'Betreff: {subject or "(kein Betreff)"}'
+            f'</div>'
+        )
+    quoted = (
+        '<blockquote style="margin:0;padding-left:.8em;border-left:2px solid #ccc;">'
+        f'{original_html}'
+        '</blockquote>'
+    )
+    final_html = (
+        f'{reply_html}'
+        f'<br><br>{header_line}'
+        f'{quoted}'
+    )
+    return final_html
+
+def sanitize_llm_html(s: str) -> str:
+    """
+    Entfernt ggf. Code-Fences/Backticks, falls das LLM die Antwort fälschlich als Code formatiert hat.
+    """
+    t = (s or "").strip()
+    if t.startswith("```"):
+        t = t.strip("`").strip()
+        if t.lower().startswith("html"):
+            t = t[4:].lstrip()
+    return t
+
+class AppState(TypedDict, total=False):
+    # Wird vom StateGraph genutzt (für LangGraph)
+    messages: List[AnyMessage]
+    # Eigene Felder für E-Mail-Automat
+    lookback_iso: str
+    new_emails: List[Dict[str, Any]]
+    drafted_count: int
+    drafted_ids: List[str]
+
+def node_fetch_recent_emails(state: AppState) -> AppState:
+    """
+    Holt E-Mails der letzten LOOKBACK_MINUTEN aus dem Posteingang.
+    """
+    client = GraphClient()
+    since_iso = utc_iso_now_minus_minutes(LOOKBACK_MINUTES)
+    try:
+        msgs = client.list_messages_since(since_iso=since_iso, max_count=50)
+    except Exception as e:
+        # Fehler beim Laden der Mails, abbrechen mit Fehlermeldung als AIMessage
+        text = f"Fehler beim Abrufen neuer E-Mails: {e}"
+        return {"messages": [AIMessage(content=text)]}
+    return {
+        "lookback_iso": since_iso,
+        "new_emails": msgs,
+    }
+
+def node_generate_drafts_body_only(state: AppState) -> AppState:
+    """
+    Für jede neue Nachricht:
+    - Original (Body+Metadaten) laden
+    - KI-Antwort als HTML generieren (nur basierend auf dem Body)
+    - Antwort + Original als Zitat zusammenfügen
+    - Entwurf im Mail-Thread erstellen
+    """
+    client = GraphClient()
+    drafted = 0
+    draft_ids: List[str] = []
+
+    for m in state.get("new_emails", []):
+        msg_id = m.get("id")
+        if not msg_id:
+            continue
+        # 1) Original-Mail inkl. HTML-Body, Absender, Betreff, Datum laden
+        try:
+            core = client.get_message_core(msg_id)
+        except Exception as e:
+            draft_ids.append(f"[Lade-Fehler für {msg_id}: {e}]")
+            continue
+        body_html = core["body_html"] or "<div>(Kein Inhalt erkannt)</div>"
+        from_name = core.get("from", "")
+        sent_iso = core.get("sentDateTime", "")
+        subject = core.get("subject", "")
+        # 2) KI-Antwort generieren (nur Body-Inhalt)
+        user_text = (
+            "Erstelle eine höfliche, hilfreiche und konkrete Antwort als HTML und unterschreibe mit 'sleepingbagREBEL'. "
+            "Antworte ausschließlich basierend auf folgendem E-Mail-Body. "
+            "Gib NUR den E-Mail-Body der Antwort zurück (keinen neuen Betreff, keine Header, kein Codeblock). "
+            "Antworte in der Sprache des folgenden Inhalts.\n\n"
+            "EMAIL_BODY_HTML_START\n"
+            f"{body_html}\n"
+            "EMAIL_BODY_HTML_END"
+        )
+        try:
+            reply_html_raw = run_agent_with_tools(user_text)
+        except Exception as e:
+            reply_html_raw = ""
+            draft_ids.append(f"[Antwort-Fehler für {msg_id}: {e}]")
+        reply_html = sanitize_llm_html(reply_html_raw)
+        # Fallback-Antwort, falls LLM nichts Brauchbares geliefert hat
+        if not reply_html:
+            reply_html = (
+                "<p>Vielen Dank für Ihre Nachricht! "
+                "Wir prüfen Ihr Anliegen und melden uns in Kürze.</p>"
+                "<p>Beste Grüße<br>sleepingbagREBEL</p>"
+            )
+        # 3) Antwort + zitiertes Original kombinieren
+        combined_html = build_reply_with_history(
+            reply_html=reply_html,
+            original_html=body_html,
+            from_name=from_name,
+            sent_iso=sent_iso,
+            subject=subject,
+        )
+        # 4) Entwurf im Thread erstellen
+        try:
+            draft_id = client.create_reply_draft(original_id=msg_id, html_body=combined_html)
+            drafted += 1
+            draft_ids.append(draft_id)
+        except Exception as e:
+            draft_ids.append(f"[Draft-Fehler für {msg_id}: {e}]")
+
+    return {"drafted_count": drafted, "drafted_ids": draft_ids}
+
+def node_summarize(state: AppState) -> AppState:
+    """
+    Erstellt eine kurze Zusammenfassung der erstellten Entwürfe.
+    """
+    drafted = state.get("drafted_count", 0)
+    ids = state.get("drafted_ids", [])
+    lookback = state.get("lookback_iso", "")
+    summary_lines = [
+        f"Zeitraum: seit {lookback}",
+        f"Erstellte Entwürfe: {drafted}",
+    ]
+    if ids:
+        summary_lines.append("Draft-IDs / Meldungen:")
+        summary_lines.extend(f"- {x}" for x in ids)
+    text = "\n".join(summary_lines)
+    return {"messages": [AIMessage(content=text)]}
+
+# Graph für automatisches E-Mail-Antwortentwurf (Autodraft)
+builder_autodraft = StateGraph(AppState)
+builder_autodraft.add_node("fetch_recent_emails", node_fetch_recent_emails)
+builder_autodraft.add_node("generate_drafts_body_only", node_generate_drafts_body_only)
+builder_autodraft.add_node("summarize", node_summarize)
+builder_autodraft.add_edge(START, "fetch_recent_emails")
+builder_autodraft.add_edge("fetch_recent_emails", "generate_drafts_body_only")
+builder_autodraft.add_edge("generate_drafts_body_only", "summarize")
+builder_autodraft.add_edge("summarize", END)
+graph_autodraft = builder_autodraft.compile()
+
+# =================================
+# ====== CHAT GRAPH (CONVERSATION)
+# =================================
 class State(MessagesState):
     pass
 
-# =========================
-# === Anthropic-Guards ====
-# =========================
-def _has_nonempty_content(msg) -> bool:
-    c = getattr(msg, "content", None)
-    if c is None:
-        return False
-    if isinstance(c, str):
-        return c.strip() != ""
-    if isinstance(c, list):
-        return len(c) > 0
-    return True  # konservativ
-
-def _normalized_msgs_for_anthropic(msgs, system_text: str):
-    """Sichert: System vorn, keine leeren Messages, erster Nicht-System ist Human."""
-    # System vorne
-    if not msgs or (hasattr(msgs[0], "type") and msgs[0].type != "system"):
-        msgs = [SystemMessage(content=system_text)] + msgs
-
-    # Leere Human/AI/System entfernen
-    cleaned = []
-    for m in msgs:
-        if getattr(m, "type", None) in ("human", "ai", "system"):
-            if not _has_nonempty_content(m):
-                continue
-        cleaned.append(m)
-
-    # Nach System muss ein Human kommen; sonst kein LLM-Call
-    if cleaned and cleaned[0].type == "system":
-        tail = cleaned[1:]
-    else:
-        tail = cleaned
-
-    if not tail:
-        return cleaned  # nur System → no-op später
-
-    if tail[0].type != "human":
-        # Historie beginnt nicht mit Human (z. B. Tool/AI) → lieber no-op
-        return cleaned
-
-    return cleaned
-
 def agent_node(state: State, config: RunnableConfig):
     """
-    Ruft das Modell mit der bisherigen Message-Historie auf
-    und gibt die neue AIMessage in den State zurück.
-    Verhindert 400er bei Background-Runs (leere/fehlende User-Message).
+    Ruft das LLM (mit Tools) auf, um die nächste Antwort zu erzeugen.
     """
-    msgs = state["messages"]
-    msgs = _normalized_msgs_for_anthropic(msgs, SYSTEM)
-
-    only_system = len(msgs) == 1 and msgs[0].type == "system"
-    first_is_human = (len(msgs) > 1 and msgs[0].type == "system" and msgs[1].type == "human") or (len(msgs) > 0 and msgs[0].type == "human")
-
-    if only_system or not first_is_human:
-        # Kein valider Human-Turn → kein Model-Call (fixes Anthropic 400)
-        return {"messages": []}
-
-    ai = llm_with_tools.invoke(msgs, config=config)
+    msgs = [SystemMessage(content=SYSTEM)] + state["messages"]
+    ai: AIMessage = llm_with_tools.invoke(msgs, config=RunnableConfig())
     return {"messages": [ai]}
 
 tool_node = ToolNode(TOOLS)
 
-builder = StateGraph(State)
-builder.add_node("agent", agent_node)
-builder.add_node("tools", tool_node)
-
-builder.add_edge(START, "agent")
-builder.add_conditional_edges("agent", tools_condition)  # ruft Tools, wenn vom LLM angefordert
-builder.add_edge("tools", "agent")
-
+builder_chat = StateGraph(State)
+builder_chat.add_node("agent", agent_node)
+builder_chat.add_node("tools", tool_node)
+builder_chat.add_edge(START, "agent")
+builder_chat.add_conditional_edges("agent", tools_condition, { "tools": "tools", END: END })
+builder_chat.add_edge("tools", "agent")
 checkpointer = InMemorySaver()
-graph = builder.compile(checkpointer=checkpointer)
+graph_chat = builder_chat.compile(checkpointer=checkpointer)
 
 # Alias für Cloud-Configs, die 'graph_chat' erwarten
-graph_chat = graph
+graph = graph_chat
 
 if __name__ == "__main__":
     thread = {"configurable": {"thread_id": str(uuid.uuid4())}}
 
     # Beispiel: Tracking-Link suchen
-    q0 = {"role":"user","content":"finde_lieferung für max.mustermann@example.com"}
-    out0 = graph.invoke({"messages":[q0]}, config=thread)
-    print("ASSISTANT (finde_lieferung):", out0["messages"][-1].content[:800] if out0["messages"] else "<no reply>")
+    q0 = {"role": "user", "content": "finde_lieferung für max.mustermann@example.com"}
+    out0 = graph_chat.invoke({"messages": [q0]}, config=thread)
+    print("ASSISTANT (finde_lieferung):", out0["messages"][-1].content[:200] if out0["messages"] else "<no reply>")
 
     # Beispiel: RAG
-    q1 = {"role":"user","content":"Bitte nutze 'rag' und beantworte: Wie reklamiere ich defektes Zubehör?"}
-    out1 = graph.invoke({"messages": [q1]}, config=thread)
-    print("ASSISTANT (RAG):", out1["messages"][-1].content[:800] if out1["messages"] else "<no reply>")
+    q1 = {"role": "user", "content": "Bitte nutze 'rag' und beantworte: Wie reklamiere ich defektes Zubehör?"}
+    out1 = graph_chat.invoke({"messages": [q1]}, config=thread)
+    print("ASSISTANT (RAG):", out1["messages"][-1].content[:200] if out1["messages"] else "<no reply>")
 
     # Beispiel: Bedingungen
-    q2 = {"role":"user","content":"Nutze 'bedingungen' und sag mir, wie der Versand läuft"}
-    out2 = graph.invoke({"messages":[q2]}, config=thread)
-    print("ASSISTANT (Bedingungen):", out2["messages"][-1].content[:800] if out2["messages"] else "<no reply>")
+    q2 = {"role": "user", "content": "Nutze 'bedingungen' und sag mir, wie der Versand läuft"}
+    out2 = graph_chat.invoke({"messages": [q2]}, config=thread)
+    print("ASSISTANT (Bedingungen):", out2["messages"][-1].content[:200] if out2["messages"] else "<no reply>")
 
+    # Beispiel: Automatische E-Mail-Antworten generieren
+    out3 = graph_autodraft.invoke({})
+    print("ASSISTANT (Autodraft Zusammenfassung):", out3["messages"][0].content if out3.get("messages") else "<keine Ausgabe>")
