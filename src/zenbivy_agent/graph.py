@@ -7,7 +7,7 @@ from typing_extensions import TypedDict
 from dotenv import load_dotenv
 load_dotenv()
 
-from langchain_core.messages import AnyMessage, SystemMessage
+from langchain_core.messages import AnyMessage, SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END, MessagesState
@@ -21,7 +21,6 @@ from langchain_anthropic import ChatAnthropic
 # --- RAG-Dependencies ---
 import chromadb
 from chromadb.config import Settings
-
 try:
     from sentence_transformers import SentenceTransformer
 except Exception:
@@ -45,7 +44,7 @@ except Exception:
 # =========================
 # ====== LLM & PROMPT =====
 # =========================
-MODEL = "claude-opus-4-1-20250805"  # unverändert wie bei dir
+MODEL = "claude-opus-4-1-20250805"  # dein Wunschmodell
 
 SYSTEM = (
     "Du bist sleepingbagREBEL, ein präziser, netter Mitarbeiter von Zenbivy. "
@@ -171,8 +170,8 @@ _HEADERS = {"User-Agent": _USER_AGENT}
 def _extract_text_and_images(html: str, base_url: str):
     """
     Kompaktes Extrahieren von Text + bis zu 12 Bildern.
-    Verbessert: berücksichtigt og:image & figcaption; dedupliziert Bilder.
-    Rückgabe bleibt kompatibel: images = [{ "src", "alt" }, ...]
+    Berücksichtigt og:image & figcaption; dedupliziert Bilder.
+    Rückgabe: images = [{ "src", "alt" }, ...]
     """
     soup = BeautifulSoup(html, "html.parser")
 
@@ -209,11 +208,10 @@ def _extract_text_and_images(html: str, base_url: str):
         alt = (img.get("alt") or img.get("title") or "").strip()
         cap_tag = fig.find("figcaption")
         if cap_tag and not alt:
-            # falls Alt leer, versuche figcaption
             alt = " ".join(cap_tag.get_text(" ", strip=True).split())
         images.append({"src": src, "alt": alt})
 
-    # 2) og:image / twitter:image (als ergänzende Hinweise)
+    # 2) og:image / twitter:image (ergänzend)
     for m in soup.find_all("meta"):
         prop = (m.get("property") or m.get("name") or "").lower()
         if prop in {"og:image", "twitter:image", "image"}:
@@ -549,14 +547,63 @@ llm_with_tools = llm.bind_tools(TOOLS)
 class State(MessagesState):
     pass
 
+# =========================
+# === Anthropic-Guards ====
+# =========================
+def _has_nonempty_content(msg) -> bool:
+    c = getattr(msg, "content", None)
+    if c is None:
+        return False
+    if isinstance(c, str):
+        return c.strip() != ""
+    if isinstance(c, list):
+        return len(c) > 0
+    return True  # konservativ
+
+def _normalized_msgs_for_anthropic(msgs, system_text: str):
+    """Sichert: System vorn, keine leeren Messages, erster Nicht-System ist Human."""
+    # System vorne
+    if not msgs or (hasattr(msgs[0], "type") and msgs[0].type != "system"):
+        msgs = [SystemMessage(content=system_text)] + msgs
+
+    # Leere Human/AI/System entfernen
+    cleaned = []
+    for m in msgs:
+        if getattr(m, "type", None) in ("human", "ai", "system"):
+            if not _has_nonempty_content(m):
+                continue
+        cleaned.append(m)
+
+    # Nach System muss ein Human kommen; sonst kein LLM-Call
+    if cleaned and cleaned[0].type == "system":
+        tail = cleaned[1:]
+    else:
+        tail = cleaned
+
+    if not tail:
+        return cleaned  # nur System → no-op später
+
+    if tail[0].type != "human":
+        # Historie beginnt nicht mit Human (z. B. Tool/AI) → lieber no-op
+        return cleaned
+
+    return cleaned
+
 def agent_node(state: State, config: RunnableConfig):
     """
     Ruft das Modell mit der bisherigen Message-Historie auf
     und gibt die neue AIMessage in den State zurück.
+    Verhindert 400er bei Background-Runs (leere/fehlende User-Message).
     """
     msgs = state["messages"]
-    if not msgs or msgs[0].type != "system":
-        msgs = [SystemMessage(content=SYSTEM)] + msgs
+    msgs = _normalized_msgs_for_anthropic(msgs, SYSTEM)
+
+    only_system = len(msgs) == 1 and msgs[0].type == "system"
+    first_is_human = (len(msgs) > 1 and msgs[0].type == "system" and msgs[1].type == "human") or (len(msgs) > 0 and msgs[0].type == "human")
+
+    if only_system or not first_is_human:
+        # Kein valider Human-Turn → kein Model-Call (fixes Anthropic 400)
+        return {"messages": []}
 
     ai = llm_with_tools.invoke(msgs, config=config)
     return {"messages": [ai]}
@@ -573,6 +620,8 @@ builder.add_edge("tools", "agent")
 
 checkpointer = InMemorySaver()
 graph = builder.compile(checkpointer=checkpointer)
+
+# Alias für Cloud-Configs, die 'graph_chat' erwarten
 graph_chat = graph
 
 if __name__ == "__main__":
@@ -584,10 +633,9 @@ if __name__ == "__main__":
         "content": "Bitte nutze 'rag' und beantworte: Wie reklamiere ich defektes Zubehör?"
     }
     out1 = graph.invoke({"messages": [q1]}, config=thread)
-    print("ASSISTANT (RAG):", out1["messages"][-1].content[:1200])
+    print("ASSISTANT (RAG):", out1["messages"][-1].content[:1200] if out1["messages"] else "<no reply>")
 
     # Bestehende Tools funktionieren weiter
     q2 = {"role":"user", "content":"Nutze 'bedingungen' und sag mir, wie der Versand läuft"}
     out2 = graph.invoke({"messages":[q2]}, config=thread)
-    print("ASSISTANT (Bedingungen):", out2["messages"][-1].content[:800])
-
+    print("ASSISTANT (Bedingungen):", out2["messages"][-1].content[:800] if out2["messages"] else "<no reply>")
