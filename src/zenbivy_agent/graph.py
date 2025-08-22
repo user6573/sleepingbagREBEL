@@ -1,21 +1,25 @@
+# graph.py
 from __future__ import annotations
 
 import uuid, os, re, json, time, random, datetime as dt
 from typing import Annotated, Literal, List, Dict, Any, Optional, Tuple
 from typing_extensions import TypedDict
+from pathlib import Path
 
 from dotenv import load_dotenv
 load_dotenv()
 
+# =========================
+# ===== LangChain/LG ======
+# =========================
 from langchain_core.messages import AnyMessage, SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END, MessagesState
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.checkpoint.memory import InMemorySaver
 
-# LLM (Claude via Anthropic)
+# LLM (Claude)
 from langchain_anthropic import ChatAnthropic
 
 # --- RAG-Dependencies ---
@@ -41,7 +45,7 @@ try:
 except Exception:
     TavilyClient = None
 
-# --- MS Graph (für finde_lieferung) ---
+# --- MS Graph (Koch-Tracking + AutoDraft) ---
 try:
     from msal import ConfidentialClientApplication
 except Exception:
@@ -50,8 +54,6 @@ except Exception:
 # =========================
 # ====== LLM & PROMPT =====
 # =========================
-MODEL = "claude-opus-4-1-20250805"  # dein Wunschmodell
-
 SYSTEM = (
     "Du bist sleepingbagREBEL, ein präziser, netter Mitarbeiter von Zenbivy. "
     "Zeige nicht, dass du eine KI bist. "
@@ -70,10 +72,27 @@ SYSTEM = (
     "Wenn du Webseiten nutzt, integriere relevante Bildinformationen (Alt-Text, Bildunterschrift) inhaltlich in deine Antwort, aber füge keine großen HTML-Blöcke ein."
 )
 
+# Anthropic / Modell-Config
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-7-sonnet-20250219")
+REQ_MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", "8000"))
+ANTHROPIC_OUTPUT_128K = os.getenv("ANTHROPIC_OUTPUT_128K", "0") == "1"
+ANTHROPIC_FALLBACK_MODEL = os.getenv("ANTHROPIC_FALLBACK_MODEL", "claude-3-5-sonnet-20241022")
+SAFE_MAX_TOKENS = REQ_MAX_TOKENS if ANTHROPIC_OUTPUT_128K else min(REQ_MAX_TOKENS, 8000)
+_extra_headers = {"anthropic-beta": "output-128k-2025-02-19"} if ANTHROPIC_OUTPUT_128K else None
+
+llm = ChatAnthropic(
+    model=ANTHROPIC_MODEL,
+    api_key=ANTHROPIC_API_KEY,
+    temperature=0.2,
+    max_tokens=SAFE_MAX_TOKENS,
+    extra_headers=_extra_headers,
+)
+
 # =========================
 # ====== PFAD/DATEIEN =====
 # =========================
-_BASE_DIR = r"C:\Users\Fritz\Desktop\Python\sleepingbagREBEL_Infos\geschliffen"
+_BASE_DIR = os.getenv("ZENBIVY_DATA_DIR", r"C:\Users\Fritz\Desktop\Python\sleepingbagREBEL_Infos\geschliffen")
 
 DateiAuswahl = Literal[
     "Compression Caps",
@@ -168,6 +187,12 @@ _SOURCES = {
     "Give Away": "https://zenbivy.eu/pages/giveaway",
 }
 
+POLICIES: Dict[PolicyKey, str] = {
+    "Rabattcode": "Rabattcodes erhältst du im Newsletter (https://zenbivy.eu).",
+    "Rückgabe- & Umtauschbedingungen": "Rückgabe/Umtausch: 14 Tage ab Erhalt; Artikel unbenutzt. Details auf der Website.",
+    "Versandbedingungen": "Versand: EU-weit; Laufzeiten 2–7 Werktage. Genaues auf https://zenbivy.eu.",
+}
+
 _USER_AGENT = "Mozilla/5.0 (compatible; ZenbivyAgent/1.0)"
 _HEADERS = {"User-Agent": _USER_AGENT}
 
@@ -178,17 +203,15 @@ def _extract_text_and_images(html: str, base_url: str):
     """
     Kompaktes Extrahieren von Text + bis zu 12 Bildern.
     Berücksichtigt og:image & figcaption; dedupliziert Bilder.
-    Rückgabe: images = [{ "src", "alt" }, ...]
+    Rückgabe: (title, text, images=[{src,alt}])
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    # irrelevante Tags entfernen
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
 
     main = soup.find("main") or soup.find("article") or soup.body or soup
 
-    # sichtbaren Text
     parts = []
     for el in main.find_all(["h1","h2","h3","h4","h5","h6","p","li"], recursive=True):
         t = " ".join(el.get_text(" ", strip=True).split())
@@ -198,10 +221,9 @@ def _extract_text_and_images(html: str, base_url: str):
     if len(text) > 8000:
         text = text[:8000] + " … [gekürzt]"
 
-    # Bilder sammeln
     images: List[Dict[str, str]] = []
 
-    # 1) figure + figcaption
+    # figures
     for fig in main.find_all("figure"):
         img = fig.find("img")
         if not img:
@@ -218,7 +240,7 @@ def _extract_text_and_images(html: str, base_url: str):
             alt = " ".join(cap_tag.get_text(" ", strip=True).split())
         images.append({"src": src, "alt": alt})
 
-    # 2) og:image / twitter:image (ergänzend)
+    # og:image / twitter:image
     for m in soup.find_all("meta"):
         prop = (m.get("property") or m.get("name") or "").lower()
         if prop in {"og:image", "twitter:image", "image"}:
@@ -228,7 +250,7 @@ def _extract_text_and_images(html: str, base_url: str):
                 if not src.lower().endswith(".svg"):
                     images.append({"src": src, "alt": ""})
 
-    # 3) generische <img>
+    # generic <img>
     for img in main.find_all("img"):
         src = img.get("src") or img.get("data-src") or img.get("data-original")
         if not src:
@@ -239,7 +261,6 @@ def _extract_text_and_images(html: str, base_url: str):
         alt = (img.get("alt") or img.get("title") or "").strip()
         images.append({"src": src, "alt": alt})
 
-    # Deduplizieren nach URL, triviale Assets ausfiltern
     blacklist = ("sprite", "icon", "logo", "placeholder", "tracking", "pixel", "badge", "spinner")
     seen = set()
     deduped = []
@@ -279,29 +300,10 @@ def search_web(
     restrict_to_zenbivy: bool = True,
 ) -> dict:
     """
-    [Aktiv nutzen] Websuche via Tavily ODER Direkt-URL:
-      - Bei DIREKTER URL: lädt die Seite sofort und gibt Text + Bilder (Alt/Captions) zurück.
+    Websuche via Tavily ODER Direkt-URL:
+      - Bei DIREKTER URL: lädt die Seite und gibt Text + Bilder zurück.
       - Bei SUCHE: findet relevante Seiten (optional auf zenbivy.com/.eu beschränkt) und lädt jede Seite.
-    Parameter:
-      - query: Suchbegriff ODER direkte URL (https://...).
-      - max_results: 1–10 (Standard 5).
-      - restrict_to_zenbivy: True => nur zenbivy.com/zenbivy.eu durchsuchen.
-    Rückgabe:
-      {
-        "query": str,
-        "restricted": bool,
-        "results": [
-          { "title": str, "url": str, "snippet": str, "score": float|None,
-            "page": {"url": str, "title": str, "text": str, "images": [{"src","alt"}] } | {"url": str, "error": str}
-          },
-          ...
-        ]
-      }
-    Hinweise:
-      - Bilder sind wichtig für Größen/Anleitungen/Produktdetails; bis zu 12 werden geliefert.
-      - Nutze dieses Tool proaktiv, wenn externe Fakten/Seiteninhalte gebraucht werden.
     """
-    # Direkter URL-Fetch ohne Suche
     if _looks_like_url(query):
         page = _fetch_page(query.strip())
         return {
@@ -316,7 +318,6 @@ def search_web(
             }],
         }
 
-    # Tavily verfügbar?
     if TavilyClient is None:
         return {"query": query, "error": "tavily-python nicht installiert. Bitte 'pip install tavily-python'."}
 
@@ -325,7 +326,6 @@ def search_web(
         return {"query": query, "error": "TAVILY_API_KEY fehlt in der Umgebung."}
 
     client = TavilyClient(api_key=api_key)
-
     include_domains = ["zenbivy.com", "zenbivy.eu"] if restrict_to_zenbivy else None
     try:
         search = client.search(
@@ -359,11 +359,7 @@ def search_web(
 @tool("gear_guide")
 def gear_guide(name: GuideKey) -> dict:
     """
-    [Aktiv nutzen] Lädt vordefinierte Zenbivy-Seiten (Größen, Anleitung, Füllgewicht, Zubehör, Kontakt …)
-    und gibt strukturierte Infos inkl. Bildhinweisen zurück.
-    Input: einer der festen Schlüssel (z. B. 'Größentabelle', 'Gebrauchsanweisung').
-    Output: { source, url, title, text, images:[{src,alt}] }
-    Hinweis: Bilder/Alt-Texte können relevante Maßtabellen oder Diagramme andeuten – inhaltlich erwähnen, nicht einbetten.
+    Lädt vordefinierte Zenbivy-Seiten und gibt strukturierte Infos inkl. Bildhinweisen zurück.
     """
     url = _SOURCES[name]
     try:
@@ -378,25 +374,20 @@ def gear_guide(name: GuideKey) -> dict:
 def bedingungen(kategorie: PolicyKey) -> str:
     return POLICIES[kategorie]
 
+_DATA_DIR = Path(os.getenv("DATA_DIR", Path.cwd() / "data"))
 @tool("wieder_verfuegbar")
 def wieder_verfuegbar(datei: DateiAuswahl) -> str:
     """
-    [Aktiv nutzen] Öffnet '{datei}.txt' aus dem Datenordner und liefert den Inhalt (Verfügbarkeiten/Termine).
-    Eingabe: exakter Dateischlüssel wie in 'DateiAuswahl'.
-    Hinweis: Eine Datei kann mehrere Produkte enthalten – bitte in der Antwort klar zuordnen.
+    Öffnet '{datei}.txt' aus dem Datenordner und liefert den Inhalt (Verfügbarkeiten/Termine).
     """
     filename = f"{datei}.txt"
-    path = os.path.join(_BASE_DIR, filename)
-    if not os.path.isfile(path):
+    path = _DATA_DIR / filename
+    if not path.exists():
         return f"[FEHLER] Datei nicht gefunden: {filename}"
-    for enc in ("utf-8-sig","utf-8","cp1252","latin-1"):
-        try:
-            with open(path, "r", encoding=enc, errors="strict") as f:
-                return f.read()
-        except Exception:
-            continue
-    with open(path, "rb") as f:
-        return f.read().decode("utf-8", errors="ignore")
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return path.read_text(encoding="latin-1", errors="ignore")
 
 # =========================
 # === MS GRAPH TOOL: finde_lieferung ===
@@ -405,15 +396,9 @@ def _normalize_email(e: str) -> str:
     return (e or "").strip().lower()
 
 def _extract_tracking_links_from_html(html_or_text: str) -> Tuple[List[str], List[str]]:
-    """
-    Extrahiert Tracking-Links (post.at) und ggf. Versandeinheits-IDs (lange Ziffernfolgen).
-    Gibt (links, ids) zurück.
-    """
     content = html_or_text or ""
-    # HTML -> Text grob: Entities & <br> -> newline
     try:
         soup = BeautifulSoup(content, "html.parser")
-        # Links direkt aus <a href>
         hrefs = [a.get("href") for a in soup.find_all("a") if a.get("href")]
         text = soup.get_text("\n", strip=True)
         candidates = hrefs + re.findall(r"https?://[^\s<>\"]+", text)
@@ -421,21 +406,17 @@ def _extract_tracking_links_from_html(html_or_text: str) -> Tuple[List[str], Lis
         text = re.sub(r"<[^>]+>", " ", content)
         candidates = re.findall(r"https?://[^\s<>\"]+", text)
 
-    # Nur post.at (robust)
     post_links = [u for u in candidates if re.search(r"(^|://)(www\.)?post\.at/", u)]
-    # Duplikate entfernen, Reihenfolge halten
     seen = set(); uniq_links = []
     for u in post_links:
         if u not in seen:
             seen.add(u); uniq_links.append(u)
 
-    # IDs: aus URL param pnum1=... ODER aus Text (lange Ziffern)
     ids = []
     for u in uniq_links:
         m = re.search(r"(?:\?|&|/)(?:pnum1|barcodelist|barcode|pnum)=([0-9]{10,})", u)
         if m:
             ids.append(m.group(1))
-    # zusätzlich aus Text
     for m in re.finditer(r"\b([0-9]{18,30})\b", text):
         if m.group(1) not in ids:
             ids.append(m.group(1))
@@ -450,7 +431,7 @@ class _GraphKochClient:
         self.tenant = os.getenv("MS_TENANT_ID")
         self.client_id = os.getenv("MS_CLIENT_ID")
         self.client_secret = os.getenv("MS_CLIENT_SECRET")
-        self.mailbox = os.getenv("MS_SHARED_MAILBOX_KOCH")  # Shared Mailbox (Versand)
+        self.mailbox = os.getenv("MS_SHARED_MAILBOX_KOCH")  # separate Mailbox für Tracking-Suche
         if not (self.tenant and self.client_id and self.client_secret and self.mailbox):
             raise RuntimeError("Fehlende ENV Variablen: MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET, MS_SHARED_MAILBOX_KOCH")
 
@@ -473,9 +454,6 @@ class _GraphKochClient:
         return h
 
     def list_sent_messages_top(self, top: int = 400) -> List[Dict[str, Any]]:
-        """
-        Holt die neuesten 'top' Nachrichten aus Gesendete Elemente.
-        """
         url = f"{self.GRAPH_BASE}/users/{self.mailbox}/mailFolders/SentItems/messages"
         params = {
             "$top": str(max(1, min(int(top), 400))),
@@ -487,9 +465,6 @@ class _GraphKochClient:
         return r.json().get("value", [])
 
     def get_message_body(self, msg_id: str) -> Dict[str, Any]:
-        """
-        Holt Body als Text (per Prefer-Header), plus ein paar Metadaten.
-        """
         url = f"{self.GRAPH_BASE}/users/{self.mailbox}/messages/{msg_id}"
         params = {"$select": "id,subject,sentDateTime,receivedDateTime,body"}
         r = requests.get(url, headers=self._headers(prefer_text=True), params=params, timeout=20)
@@ -515,26 +490,7 @@ def _addresses(lst) -> List[str]:
 @tool("finde_lieferung")
 def finde_lieferung(email: str) -> dict:
     """
-    Durchsucht das **Shared Mailbox** 'Koch Alpin GmbH - Service' → Ordner **Gesendete Elemente** (SentItems),
-    max. die **400 neuesten** Mails, nach einer Mail, die an die gegebene **E-Mail-Adresse** gesendet wurde
-    (To/Cc/Bcc). Findet die Mail und extrahiert den **Sendungs-Status-Link** (post.at).
-
-    Input: email (str)
-    Output:
-      {
-        "email": "...",
-        "matched": true|false,
-        "message": {
-           "id": "...", "subject": "...",
-           "sentDateTime": "...", "receivedDateTime": "..."
-        } | null,
-        "status_link": "http://www.post.at/tnt_query.php?pnum1=...",  # wenn gefunden
-        "versand_ids": ["..."],  # falls extrahierbar
-        "checked_count": 123,
-        "note": "..."
-      }
-
-    Erfordert ENV: MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET, MS_SHARED_MAILBOX_KOCH
+    Durchsucht 'Gesendete Elemente' der Koch-Mailbox und extrahiert post.at-Trackinglink.
     """
     try:
         client = _GraphKochClient()
@@ -646,21 +602,7 @@ def _build_context(docs: List[str], metas: List[Dict[str,Any]], max_chars: int =
 @tool("rag")
 def rag(query: str, top_k: int = 5) -> dict:
     """
-    [Aktiv nutzen] Durchsuche den Outlook-RAG-Index (Chroma) und liefere kompakten Kontext + Quellen.
-    - Verwende dies proaktiv für E-Mail-Antworten, um bestehende Wissens-Snippets zu holen.
-    - Nach Nutzung: Inhalte verallgemeinern; keine Personen-/Datumsdetails übernehmen.
-    Parameter:
-      - query: Suchfrage
-      - top_k: Anzahl der Snippets (Default 5)
-    Rückgabe:
-      {
-        "context": str,           # textfertiger Kontext für LLM
-        "sources": [str],         # z.B. ["abc#chunk1/3", ...]
-        "items": [                # strukturierte Quelleninfos
-           {"ref": str, "subject": str, "first_time": str, "last_time": str,
-            "message_count": int, "chunk": int, "chunks_total": int}
-        ]
-      }
+    Outlook-RAG-Index (Chroma) durchsuchen und kompakten Kontext zurückgeben.
     """
     index_dir = os.getenv("CHROMA_PATH") or "./rag_index"
     client = chromadb.PersistentClient(path=index_dir, settings=Settings(allow_reset=False))
@@ -668,14 +610,12 @@ def rag(query: str, top_k: int = 5) -> dict:
     if coll.count() == 0:
         return {"error": f"Leerer Index unter {index_dir}. Bitte Index kopieren/erstellen."}
 
-    # Embedding-Provider
     emb_type = (os.getenv("RAG_EMBEDDING") or "local").lower()
     if emb_type == "openai":
         embedder = _OpenAIEmbedder(model=os.getenv("OPENAI_EMBED_MODEL","text-embedding-3-small"))
     else:
         embedder = _LocalEmbedder()
 
-    # 1) Vektor-Pool
     emb = embedder.embed([query])[0]
     pool_n = max(top_k, int(os.getenv("BM25_POOL", "20")))
     res = coll.query(query_embeddings=[emb], n_results=pool_n, include=["documents","metadatas","distances"])
@@ -683,7 +623,6 @@ def rag(query: str, top_k: int = 5) -> dict:
     metas = res.get("metadatas", [[]])[0]
     dists = res.get("distances", [[]])[0]
 
-    # 2) Hybrid-Rerank (optional)
     hybrid = (os.getenv("HYBRID", "true").lower() != "false") and (BM25Okapi is not None)
     alpha = float(os.getenv("HYBRID_ALPHA", "0.5"))
     if hybrid and docs:
@@ -691,14 +630,13 @@ def rag(query: str, top_k: int = 5) -> dict:
         bm25 = BM25Okapi(corpus_tokens)
         q_tokens = _tokenize([query])[0]
         bm_scores = bm25.get_scores(q_tokens)
-        # Distanz -> Similarität [0..1]
         if dists:
             max_d, min_d = max(dists), min(dists); rng = max(1e-9, max_d - min_d)
             vec_scores = [1.0 - ((d - min_d) / rng) for d in dists]
         else:
             vec_scores = [0.0]*len(docs)
-        max_b = max(bm_scores) if bm_scores else 1.0
-        bm_norm = [(s/max_b) if max_b else 0.0 for s in bm_scores]
+        max_b = max(bm_scores) if bm_scores is not None and len(bm_scores) else 1.0
+        bm_norm = [(s/max_b) if max_b else 0.0 for s in (bm_scores or [])]
         scored = []
         for i in range(len(docs)):
             score = alpha*bm_norm[i] + (1-alpha)*vec_scores[i]
@@ -717,25 +655,10 @@ def rag(query: str, top_k: int = 5) -> dict:
 # =========================
 # ======== LLM BIND =======
 # =========================
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-# Für mögliche Fallback-Nutzung ein alternatives Modell aus ENV laden
-ANTHROPIC_FALLBACK_MODEL = os.getenv("ANTHROPIC_FALLBACK_MODEL")
-
-# Haupt-LLM initialisieren (Claude-Modell)
-llm = ChatAnthropic(
-    model=MODEL,
-    api_key=ANTHROPIC_API_KEY,
-    temperature=0.2,
-    max_tokens=8000  # sichere Grenze (kann angepasst werden)
-)
 TOOLS = [wieder_verfuegbar, bedingungen, gear_guide, rag, search_web, finde_lieferung]
 llm_with_tools = llm.bind_tools(TOOLS)
-# Hilfs-Mapping für Tool-Nutzung außerhalb des Graphen
 _TOOL_MAP = {t.name: t for t in TOOLS}
 
-# =========================
-# ===== LLM INVOCATION UTILS (mit Tool-Schleife) =====
-# =========================
 def _is_retryable_error(exc: Exception) -> bool:
     s = str(exc).lower()
     return any(k in s for k in [
@@ -744,9 +667,6 @@ def _is_retryable_error(exc: Exception) -> bool:
     ])
 
 def _invoke_with_retry(_llm, msgs, attempts: int = 6, base: float = 0.5, cap: float = 20.0):
-    """
-    Führt den LLM-Aufruf mit Retry-Strategie durch (bei Überlastungs-/Timeout-Fehlern).
-    """
     for i in range(attempts):
         try:
             return _llm.invoke(msgs, config=RunnableConfig())
@@ -756,74 +676,96 @@ def _invoke_with_retry(_llm, msgs, attempts: int = 6, base: float = 0.5, cap: fl
             sleep_s = min(cap, base * (2 ** i)) + random.uniform(0, 0.5)
             time.sleep(sleep_s)
 
-def _try_invoke_with_fallback(msgs: List[AnyMessage]):
-    """
-    Versucht den LLM-Aufruf mit Tools und fällt bei Fehler optional auf ein anderes Modell zurück.
-    """
+def _try_invoke_with_fallback(msgs):
     try:
         return _invoke_with_retry(llm_with_tools, msgs)
     except Exception as e:
-        # Bei bestimmten Fehlern alternativ mit Fallback-Modell probieren (falls definiert)
-        if _is_retryable_error(e) and ANTHROPIC_FALLBACK_MODEL:
+        if _is_retryable_error(e):
             alt_llm = ChatAnthropic(
                 model=ANTHROPIC_FALLBACK_MODEL,
                 api_key=ANTHROPIC_API_KEY,
                 temperature=0.2,
-                max_tokens=8000
+                max_tokens=min(SAFE_MAX_TOKENS, 8000),
             ).bind_tools(TOOLS)
             return _invoke_with_retry(alt_llm, msgs)
         raise
 
 def run_agent_with_tools(user_text: str) -> str:
     """
-    Führt eine einmalige Anfrage an das LLM (mit Tools) durch und gibt die AI-Antwort zurück.
+    Einmalige Tool-Schleife für einfache Prompts -> Textantwort.
     """
-    msgs: List[AnyMessage] = [SystemMessage(content=SYSTEM), HumanMessage(content=user_text)]
-    for _ in range(3):  # bis zu 3 Tool-Runden
+    msgs: List[Any] = [SystemMessage(content=SYSTEM), HumanMessage(content=user_text)]
+    for _ in range(3):
         ai: AIMessage = _try_invoke_with_fallback(msgs)
         msgs.append(ai)
         tool_calls = getattr(ai, "tool_calls", None) or []
         if not tool_calls:
-            # Keine Tool-Aufrufe mehr -> finale Antwort zurückgeben
             return (ai.content or "").strip()
-        # Tool-Aufrufe abarbeiten
         for call in tool_calls:
             name = call.get("name")
             args = call.get("args") or {}
-            tool_func = _TOOL_MAP.get(name)
-            if not tool_func:
-                # Unbekanntes Tool
+            tool = _TOOL_MAP.get(name)
+            if not tool:
                 msgs.append(ToolMessage(content=f"[FEHLER] Tool '{name}' nicht gefunden.", name=name, tool_call_id=call.get("id")))
                 continue
             try:
-                res = tool_func.invoke(args)
+                res = tool.invoke(args)
             except Exception as e:
                 res = {"error": str(e)}
             msgs.append(ToolMessage(content=str(res), name=name, tool_call_id=call.get("id")))
-    # Wenn nach 3 Runden keine finale Antwort -> Abbruch
-    return "Ich konnte die Anfrage nicht abschließen."
+    return "Ich konnte die Anfrage nicht abschließen. Bitte schreibe an friends@zenbivy.eu."
 
 # =========================
-# ====== EMAIL AUTODRAFT GRAPH =====
+# ======= CHAT GRAPH ======
 # =========================
-# Zeitraum, aus dem neue E-Mails berücksichtigt werden sollen (in Minuten)
+def _call_model(state: MessagesState) -> Dict[str, Any]:
+    msgs = [SystemMessage(content=SYSTEM)] + state["messages"]
+    ai = _try_invoke_with_fallback(msgs)
+    return {"messages": [ai]}
+
+tool_node = ToolNode(TOOLS)
+
+builder_chat = StateGraph(MessagesState)
+builder_chat.add_node("call_model", _call_model)
+builder_chat.add_node("tools", tool_node)
+
+builder_chat.add_edge(START, "call_model")
+builder_chat.add_conditional_edges(
+    "call_model",
+    tools_condition,
+    {
+        "tools": "tools",
+        END: END,
+    },
+)
+builder_chat.add_edge("tools", "call_model")
+
+graph_chat = builder_chat.compile()
+
+# =================================================
+# ====== MAIL AUTO-DRAFT GRAPH (Nodes, keine Tools)
+# =================================================
+TENANT_ID = os.environ.get("MS_TENANT_ID")
+CLIENT_ID = os.environ.get("MS_CLIENT_ID")
+CLIENT_SECRET = os.environ.get("MS_CLIENT_SECRET")
+SHARED_MAILBOX = os.environ.get("MS_SHARED_MAILBOX")  # z.B. "friends@zenbivy.eu"
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "5"))
 
 class GraphClient:
-    GRAPH_BASE = "https://graph.microsoft.com/v1.0"
     def __init__(self):
         if ConfidentialClientApplication is None:
-            raise RuntimeError("msal ist nicht installiert. Bitte 'pip install msal' und erneut versuchen.")
-        self.tenant = os.getenv("MS_TENANT_ID")
-        self.client_id = os.getenv("MS_CLIENT_ID")
-        self.client_secret = os.getenv("MS_CLIENT_SECRET")
-        self.mailbox = os.getenv("MS_SHARED_MAILBOX")  # z.B. "friends@zenbivy.eu"
-        if not (self.tenant and self.client_id and self.client_secret and self.mailbox):
-            raise RuntimeError("Fehlende ENV Variablen: MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET, MS_SHARED_MAILBOX")
+            raise RuntimeError("msal ist nicht installiert. Bitte 'pip install msal' ausführen.")
+        missing = [k for k, v in {
+            "MS_TENANT_ID": TENANT_ID, "MS_CLIENT_ID": CLIENT_ID,
+            "MS_CLIENT_SECRET": CLIENT_SECRET, "MS_SHARED_MAILBOX": SHARED_MAILBOX
+        }.items() if not v]
+        if missing:
+            raise RuntimeError(f"Fehlende ENV Variablen: {', '.join(missing)}")
+
         self.app = ConfidentialClientApplication(
-            self.client_id,
-            authority=f"https://login.microsoftonline.com/{self.tenant}",
-            client_credential=self.client_secret
+            CLIENT_ID, authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+            client_credential=CLIENT_SECRET
         )
 
     def token(self) -> str:
@@ -835,15 +777,10 @@ class GraphClient:
     def _auth_headers(self, prefer_html: bool = False) -> Dict[str, str]:
         h = {"Authorization": f"Bearer {self.token()}"}
         if prefer_html:
-            # Bei Bedarf HTML-Inhalt anfordern
             h["Prefer"] = 'outlook.body-content-type="html"'
         return h
 
     def list_messages_since(self, since_iso: str, max_count: int = 50) -> List[Dict[str, Any]]:
-        """
-        Holt E-Mails aus dem Posteingang der Shared Mailbox mit Filter receivedDateTime >= since_iso (UTC).
-        since_iso z.B. '2025-08-20T09:10:00Z'
-        """
         headers = self._auth_headers()
         params = {
             "$top": str(max_count),
@@ -851,21 +788,16 @@ class GraphClient:
             "$orderby": "receivedDateTime desc",
             "$filter": f"receivedDateTime ge {since_iso}",
         }
-        url = f"{GRAPH_BASE}/users/{self.mailbox}/mailFolders/Inbox/messages"
+        url = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/mailFolders/Inbox/messages"
         r = requests.get(url, headers=headers, params=params, timeout=20)
         r.raise_for_status()
         data = r.json()
         return data.get("value", [])
 
     def get_message_core(self, msg_id: str) -> Dict[str, Any]:
-        """
-        Liefert Kernfelder einer Mail inkl. HTML-Body, Absender, Betreff, Datum.
-        """
         headers = self._auth_headers(prefer_html=True)
-        url = f"{GRAPH_BASE}/users/{self.mailbox}/messages/{msg_id}"
-        params = {
-            "$select": "id,subject,from,sentDateTime,receivedDateTime,body",
-        }
+        url = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{msg_id}"
+        params = {"$select": "id,subject,from,sentDateTime,receivedDateTime,body"}
         r = requests.get(url, headers=headers, params=params, timeout=20)
         r.raise_for_status()
         data = r.json()
@@ -881,79 +813,54 @@ class GraphClient:
         }
 
     def create_reply_draft(self, original_id: str, html_body: str) -> str:
-        """
-        Erzeugt einen Antwort-ENTWURF zu einer bestehenden Nachricht (via createReply),
-        setzt anschließend den finalen HTML-Body und gibt die Draft-ID zurück.
-        """
         headers = self._auth_headers()
         headers["Content-Type"] = "application/json"
-        # 1) Reply-Entwurf erzeugen (behält Thread-Header)
-        url_create = f"{GRAPH_BASE}/users/{self.mailbox}/messages/{original_id}/createReply"
+
+        # 1) Reply-Entwurf anlegen
+        url_create = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}/createReply"
         r = requests.post(url_create, headers=headers, timeout=20)
         r.raise_for_status()
         draft = r.json()
         draft_id = draft["id"]
-        # 2) Body des Entwurfs als HTML setzen
-        url_patch = f"{GRAPH_BASE}/users/{self.mailbox}/messages/{draft_id}"
+
+        # 2) Body (HTML) setzen
+        url_patch = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{draft_id}"
         patch = {"body": {"contentType": "HTML", "content": html_body}}
         r2 = requests.patch(url_patch, headers=headers, json=patch, timeout=20)
         r2.raise_for_status()
         return draft_id
 
 def utc_iso_now_minus_minutes(minutes: int) -> str:
-    """
-    Gibt die aktuelle Zeit (UTC) als ISO8601-String mit Z-Suffix zurück, minus `minutes`.
-    """
     return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def _format_dt_for_quote(iso: Optional[str]) -> str:
-    """
-    Formatiert ein ISO-Datum knapp für die Quote-Kopfzeile.
-    Beispiel: '2025-08-21T09:15:00Z' -> '2025-08-21 09:15 UTC'
-    """
     if not iso:
         return ""
     try:
-        d = dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(dt.timezone.utc)
+        d = dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(dt.timezone(dt.timedelta(hours=0)))
         return d.strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
         return iso or ""
 
 def build_reply_with_history(reply_html: str, original_html: str,
                              from_name: str = "", sent_iso: str = "", subject: str = "") -> str:
-    """
-    Baut den finalen Antwort-HTML-Body:
-    - oben: KI-Antwort (HTML)
-    - darunter: Quote-Header + Originalnachricht als Blockquote
-    """
-    # Quote-Header
     when = _format_dt_for_quote(sent_iso)
-    header_line = ""
-    if when or from_name or subject:
-        header_line = (
-            f'<div style="margin-top:16px;margin-bottom:8px;font-size:12px;color:#555;">'
-            f'----- Original Message -----<br>'
-            f'Von: {from_name or "Unbekannt"}<br>'
-            f'Gesendet: {when or "Unbekannt"}<br>'
-            f'Betreff: {subject or "(kein Betreff)"}'
-            f'</div>'
-        )
+    header_line = (
+        f'<div style="margin-top:16px;margin-bottom:8px;font-size:12px;color:#555;">'
+        f'----- Original Message -----<br>'
+        f'Von: {from_name or "Unbekannt"}<br>'
+        f'Gesendet: {when or "Unbekannt"}<br>'
+        f'Betreff: {subject or "(kein Betreff)"}'
+        f'</div>'
+    )
     quoted = (
         '<blockquote style="margin:0;padding-left:.8em;border-left:2px solid #ccc;">'
         f'{original_html}'
         '</blockquote>'
     )
-    final_html = (
-        f'{reply_html}'
-        f'<br><br>{header_line}'
-        f'{quoted}'
-    )
-    return final_html
+    return f'{reply_html}<br><br>{header_line}{quoted}'
 
 def sanitize_llm_html(s: str) -> str:
-    """
-    Entfernt ggf. Code-Fences/Backticks, falls das LLM die Antwort fälschlich als Code formatiert hat.
-    """
     t = (s or "").strip()
     if t.startswith("```"):
         t = t.strip("`").strip()
@@ -961,82 +868,77 @@ def sanitize_llm_html(s: str) -> str:
             t = t[4:].lstrip()
     return t
 
+def _run_agent_with_tools__email(user_text: str) -> str:
+    """
+    Nutzt dein llm_with_tools (inkl. Tools) und führt bis zu 3 Tool-Runden aus.
+    """
+    msgs: List[Any] = [SystemMessage(content=SYSTEM), HumanMessage(content=user_text)]
+    for _ in range(3):
+        ai: AIMessage = _try_invoke_with_fallback(msgs)
+        msgs.append(ai)
+        tcs = getattr(ai, "tool_calls", None) or []
+        if not tcs:
+            return (ai.content or "").strip()
+        for call in tcs:
+            name = call.get("name")
+            args = call.get("args") or {}
+            tool = _TOOL_MAP.get(name)
+            if not tool:
+                msgs.append(ToolMessage(content=f"[FEHLER] Tool '{name}' nicht gefunden.", name=name, tool_call_id=call.get("id")))
+                continue
+            try:
+                res = tool.invoke(args)
+            except Exception as e:
+                res = {"error": str(e)}
+            msgs.append(ToolMessage(content=str(res), name=name, tool_call_id=call.get("id")))
+    return "<p>Vielen Dank für Ihre Nachricht! Wir melden uns in Kürze.</p><p>Beste Grüße<br>sleepingbagREBEL</p>"
+
 class AppState(TypedDict, total=False):
-    # Wird vom StateGraph genutzt (für LangGraph)
-    messages: List[AnyMessage]
-    # Eigene Felder für E-Mail-Automat
+    messages: List[Any]
     lookback_iso: str
     new_emails: List[Dict[str, Any]]
     drafted_count: int
     drafted_ids: List[str]
 
 def node_fetch_recent_emails(state: AppState) -> AppState:
-    """
-    Holt E-Mails der letzten LOOKBACK_MINUTEN aus dem Posteingang.
-    """
     client = GraphClient()
     since_iso = utc_iso_now_minus_minutes(LOOKBACK_MINUTES)
-    try:
-        msgs = client.list_messages_since(since_iso=since_iso, max_count=50)
-    except Exception as e:
-        # Fehler beim Laden der Mails, abbrechen mit Fehlermeldung als AIMessage
-        text = f"Fehler beim Abrufen neuer E-Mails: {e}"
-        return {"messages": [AIMessage(content=text)]}
-    return {
-        "lookback_iso": since_iso,
-        "new_emails": msgs,
-    }
+    msgs = client.list_messages_since(since_iso=since_iso, max_count=50)
+    return {"lookback_iso": since_iso, "new_emails": msgs}
 
 def node_generate_drafts_body_only(state: AppState) -> AppState:
-    """
-    Für jede neue Nachricht:
-    - Original (Body+Metadaten) laden
-    - KI-Antwort als HTML generieren (nur basierend auf dem Body)
-    - Antwort + Original als Zitat zusammenfügen
-    - Entwurf im Mail-Thread erstellen
-    """
     client = GraphClient()
     drafted = 0
     draft_ids: List[str] = []
 
     for m in state.get("new_emails", []):
-        msg_id = m.get("id")
-        if not msg_id:
-            continue
-        # 1) Original-Mail inkl. HTML-Body, Absender, Betreff, Datum laden
-        try:
-            core = client.get_message_core(msg_id)
-        except Exception as e:
-            draft_ids.append(f"[Lade-Fehler für {msg_id}: {e}]")
-            continue
+        msg_id = m["id"]
+
+        core = client.get_message_core(msg_id)
         body_html = core["body_html"] or "<div>(Kein Inhalt erkannt)</div>"
-        from_name = core.get("from", "")
-        sent_iso = core.get("sentDateTime", "")
-        subject = core.get("subject", "")
-        # 2) KI-Antwort generieren (nur Body-Inhalt)
+        from_name = core["from"]
+        sent_iso = core["sentDateTime"]
+        subject = core["subject"]
+
         user_text = (
             "Erstelle eine höfliche, hilfreiche und konkrete Antwort als HTML und unterschreibe mit 'sleepingbagREBEL'. "
             "Antworte ausschließlich basierend auf folgendem E-Mail-Body. "
-            "Gib NUR den E-Mail-Body der Antwort zurück (keinen neuen Betreff, keine Header, kein Codeblock). "
+            "Gib NUR den Email-Body der Antwort zurück (keinen Betreff, keine Meta-Zeilen, kein Codeblock). "
             "Antworte in der Sprache des folgenden Inhalts.\n\n"
             "EMAIL_BODY_HTML_START\n"
             f"{body_html}\n"
             "EMAIL_BODY_HTML_END"
         )
-        try:
-            reply_html_raw = run_agent_with_tools(user_text)
-        except Exception as e:
-            reply_html_raw = ""
-            draft_ids.append(f"[Antwort-Fehler für {msg_id}: {e}]")
+
+        reply_html_raw = _run_agent_with_tools__email(user_text)
         reply_html = sanitize_llm_html(reply_html_raw)
-        # Fallback-Antwort, falls LLM nichts Brauchbares geliefert hat
         if not reply_html:
             reply_html = (
                 "<p>Vielen Dank für Ihre Nachricht! "
                 "Wir prüfen Ihr Anliegen und melden uns in Kürze.</p>"
                 "<p>Beste Grüße<br>sleepingbagREBEL</p>"
             )
-        # 3) Antwort + zitiertes Original kombinieren
+
         combined_html = build_reply_with_history(
             reply_html=reply_html,
             original_html=body_html,
@@ -1044,7 +946,7 @@ def node_generate_drafts_body_only(state: AppState) -> AppState:
             sent_iso=sent_iso,
             subject=subject,
         )
-        # 4) Entwurf im Thread erstellen
+
         try:
             draft_id = client.create_reply_draft(original_id=msg_id, html_body=combined_html)
             drafted += 1
@@ -1055,9 +957,6 @@ def node_generate_drafts_body_only(state: AppState) -> AppState:
     return {"drafted_count": drafted, "drafted_ids": draft_ids}
 
 def node_summarize(state: AppState) -> AppState:
-    """
-    Erstellt eine kurze Zusammenfassung der erstellten Entwürfe.
-    """
     drafted = state.get("drafted_count", 0)
     ids = state.get("drafted_ids", [])
     lookback = state.get("lookback_iso", "")
@@ -1071,63 +970,30 @@ def node_summarize(state: AppState) -> AppState:
     text = "\n".join(summary_lines)
     return {"messages": [AIMessage(content=text)]}
 
-# Graph für automatisches E-Mail-Antwortentwurf (Autodraft)
 builder_autodraft = StateGraph(AppState)
 builder_autodraft.add_node("fetch_recent_emails", node_fetch_recent_emails)
 builder_autodraft.add_node("generate_drafts_body_only", node_generate_drafts_body_only)
 builder_autodraft.add_node("summarize", node_summarize)
+
 builder_autodraft.add_edge(START, "fetch_recent_emails")
 builder_autodraft.add_edge("fetch_recent_emails", "generate_drafts_body_only")
 builder_autodraft.add_edge("generate_drafts_body_only", "summarize")
 builder_autodraft.add_edge("summarize", END)
+
 graph_autodraft = builder_autodraft.compile()
 
 # =================================
-# ====== CHAT GRAPH (CONVERSATION)
+# ===== Default-Export (run) ======
 # =================================
-class State(MessagesState):
-    pass
-
-def agent_node(state: State, config: RunnableConfig):
-    """
-    Ruft das LLM (mit Tools) auf, um die nächste Antwort zu erzeugen.
-    """
-    msgs = [SystemMessage(content=SYSTEM)] + state["messages"]
-    ai: AIMessage = llm_with_tools.invoke(msgs, config=RunnableConfig())
-    return {"messages": [ai]}
-
-tool_node = ToolNode(TOOLS)
-
-builder_chat = StateGraph(State)
-builder_chat.add_node("agent", agent_node)
-builder_chat.add_node("tools", tool_node)
-builder_chat.add_edge(START, "agent")
-builder_chat.add_conditional_edges("agent", tools_condition, { "tools": "tools", END: END })
-builder_chat.add_edge("tools", "agent")
-checkpointer = InMemorySaver()
-graph_chat = builder_chat.compile(checkpointer=checkpointer)
-
-# Alias für Cloud-Configs, die 'graph_chat' erwarten
-graph = graph_chat
+# Für den Cron-Job:
+graph = graph_autodraft
+# Dein Chat bleibt parallel verfügbar:
+# graph_chat (bereits oben kompiliert)
 
 if __name__ == "__main__":
-    thread = {"configurable": {"thread_id": str(uuid.uuid4())}}
-
-    # Beispiel: Tracking-Link suchen
-    q0 = {"role": "user", "content": "finde_lieferung für max.mustermann@example.com"}
-    out0 = graph_chat.invoke({"messages": [q0]}, config=thread)
-    print("ASSISTANT (finde_lieferung):", out0["messages"][-1].content[:200] if out0["messages"] else "<no reply>")
-
-    # Beispiel: RAG
-    q1 = {"role": "user", "content": "Bitte nutze 'rag' und beantworte: Wie reklamiere ich defektes Zubehör?"}
-    out1 = graph_chat.invoke({"messages": [q1]}, config=thread)
-    print("ASSISTANT (RAG):", out1["messages"][-1].content[:200] if out1["messages"] else "<no reply>")
-
-    # Beispiel: Bedingungen
-    q2 = {"role": "user", "content": "Nutze 'bedingungen' und sag mir, wie der Versand läuft"}
-    out2 = graph_chat.invoke({"messages": [q2]}, config=thread)
-    print("ASSISTANT (Bedingungen):", out2["messages"][-1].content[:200] if out2["messages"] else "<no reply>")
-
-    # Beispiel: Automatische E-Mail-Antworten generieren
-    out3 = graph_autodraft.invoke({})
-    print("ASSISTANT (Autodraft Zusammenfassung):", out3["messages"][0].content if out3.get("messages") else "<keine Ausgabe>")
+    # Demo: AutoDraft ausführen
+    out = graph.invoke({})
+    print(out.get("messages", [AIMessage(content="")])[-1].content)
+    # Demo: Chat-Aufruf
+    demo = graph_chat.invoke({"messages": [HumanMessage(content="Hi! Welche Größe brauche ich bei 180 cm?")]})
+    print("CHAT:", demo["messages"][-1].content[:500])
