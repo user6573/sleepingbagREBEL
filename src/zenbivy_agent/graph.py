@@ -734,6 +734,52 @@ class GraphClient:
         r2.raise_for_status()
         return draft_id
 
+# =========================
+# ======= HELPERS =========
+# =========================
+def utc_iso_now_minus_minutes(minutes: int) -> str:
+    """UTC-ISO8601 mit Z-Suffix (z. B. 2025-08-22T14:10:00Z)."""
+    return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _format_dt_for_quote(iso: Optional[str]) -> str:
+    """ISO -> 'YYYY-MM-DD HH:MM UTC' für Quote-Header."""
+    if not iso:
+        return ""
+    try:
+        d = dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(dt.timezone(dt.timedelta(hours=0)))
+        return d.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return iso or ""
+
+def build_reply_with_history(reply_html: str, original_html: str, from_name: str = "", sent_iso: str = "", subject: str = "") -> str:
+    """Oben Antwort, darunter Original als Quote (Outlook-kompatibel)."""
+    when = _format_dt_for_quote(sent_iso)
+    header_line = ""
+    if when or from_name or subject:
+        header_line = (
+            '<div style="margin-top:16px;margin-bottom:8px;font-size:12px;color:#555;">'
+            '----- Original Message -----<br>'
+            f'Von: {from_name or "Unbekannt"}<br>'
+            f'Gesendet: {when or "Unbekannt"}<br>'
+            f'Betreff: {subject or "(kein Betreff)"}'
+            '</div>'
+        )
+    quoted = (
+        '<blockquote style="margin:0;padding-left:.8em;border-left:2px solid #ccc;">'
+        f'{original_html}'
+        '</blockquote>'
+    )
+    return f'{reply_html}<br><br>{header_line}{quoted}'
+
+def sanitize_llm_html(s: str) -> str:
+    """Entfernt Codefences/Backticks etc., falls LLM versehentlich formatiert."""
+    t = (s or "").strip()
+    if t.startswith("```"):
+        t = t.strip("`").strip()
+        if t.lower().startswith("html"):
+            t = t[4:].lstrip()
+    return t
+
 
 @tool("rag")
 def rag(query: str, top_k: int = 5) -> dict:
@@ -970,4 +1016,5 @@ if __name__ == "__main__":
     q2 = {"role":"user","content":"Nutze 'bedingungen' und sag mir, wie der Versand läuft"}
     out2 = graph.invoke({"messages":[q2]}, config=thread)
     print("ASSISTANT (Bedingungen):", out2["messages"][-1].content[:800] if out2["messages"] else "<no reply>")
+
 
