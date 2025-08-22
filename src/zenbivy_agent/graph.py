@@ -573,6 +573,7 @@ builder.add_edge("tools", "agent")
 
 checkpointer = InMemorySaver()
 graph = builder.compile(checkpointer=checkpointer)
+graph_chat = graph
 
 if __name__ == "__main__":
     thread = {"configurable": {"thread_id": str(uuid.uuid4())}}
@@ -589,3 +590,4 @@ if __name__ == "__main__":
     q2 = {"role":"user", "content":"Nutze 'bedingungen' und sag mir, wie der Versand läuft"}
     out2 = graph.invoke({"messages":[q2]}, config=thread)
     print("ASSISTANT (Bedingungen):", out2["messages"][-1].content[:800])
+
