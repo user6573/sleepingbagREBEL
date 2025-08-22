@@ -41,6 +41,12 @@ try:
 except Exception:
     TavilyClient = None
 
+# --- MS Graph (für finde_lieferung) ---
+try:
+    from msal import ConfidentialClientApplication
+except Exception:
+    ConfidentialClientApplication = None
+
 # =========================
 # ====== LLM & PROMPT =====
 # =========================
@@ -59,6 +65,7 @@ SYSTEM = (
     "• Für Verfügbarkeiten/Termine: nutze 'wieder_verfuegbar'.\n"
     "• Für E-Mail-Antworten mit vorhandenen internen Infos: nutze 'rag' (Kontext holen, dann verallgemeinern, keine Namen/Datumsangaben übernehmen).\n"
     "• Für Web-Recherche oder direkte URL-Inhalte: nutze 'search_web' (liefert Seiten-Text + Bild-Hinweise).\n"
+    "• Für Sendungs-Status-Links: nutze 'finde_lieferung' (sucht im Shared Mailbox die gesendete Versandmail und extrahiert den Tracking-Link).\n"
     "\n"
     "Wenn du Webseiten nutzt, integriere relevante Bildinformationen (Alt-Text, Bildunterschrift) inhaltlich in deine Antwort, aber füge keine großen HTML-Blöcke ein."
 )
@@ -410,6 +417,199 @@ def wieder_verfuegbar(datei: DateiAuswahl) -> str:
         return f.read().decode("utf-8", errors="ignore")
 
 # =========================
+# === MS GRAPH TOOL: finde_lieferung ===
+# =========================
+def _normalize_email(e: str) -> str:
+    return (e or "").strip().lower()
+
+def _extract_tracking_links_from_html(html_or_text: str) -> Tuple[List[str], List[str]]:
+    """
+    Extrahiert Tracking-Links (post.at) und ggf. Versandeinheits-IDs (lange Ziffernfolgen).
+    Gibt (links, ids) zurück.
+    """
+    content = html_or_text or ""
+    # HTML -> Text grob: Entities & <br> -> newline
+    try:
+        soup = BeautifulSoup(content, "html.parser")
+        # Links direkt aus <a href>
+        hrefs = [a.get("href") for a in soup.find_all("a") if a.get("href")]
+        text = soup.get_text("\n", strip=True)
+        candidates = hrefs + re.findall(r"https?://[^\s<>\"]+", text)
+    except Exception:
+        text = re.sub(r"<[^>]+>", " ", content)
+        candidates = re.findall(r"https?://[^\s<>\"]+", text)
+
+    # Nur post.at (robust)
+    post_links = [u for u in candidates if re.search(r"(^|://)(www\.)?post\.at/", u)]
+    # Duplikate entfernen, Reihenfolge halten
+    seen = set(); uniq_links = []
+    for u in post_links:
+        if u not in seen:
+            seen.add(u); uniq_links.append(u)
+
+    # IDs: aus URL param pnum1=... ODER aus Text (lange Ziffern)
+    ids = []
+    for u in uniq_links:
+        m = re.search(r"(?:\?|&|/)(?:pnum1|barcodelist|barcode|pnum)=([0-9]{10,})", u)
+        if m:
+            ids.append(m.group(1))
+    # zusätzlich aus Text
+    for m in re.finditer(r"\b([0-9]{18,30})\b", text):
+        if m.group(1) not in ids:
+            ids.append(m.group(1))
+
+    return uniq_links, ids
+
+class _GraphKochClient:
+    GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+    def __init__(self):
+        if ConfidentialClientApplication is None:
+            raise RuntimeError("msal ist nicht installiert. Bitte 'pip install msal' und erneut versuchen.")
+        self.tenant = os.getenv("MS_TENANT_ID")
+        self.client_id = os.getenv("MS_CLIENT_ID")
+        self.client_secret = os.getenv("MS_CLIENT_SECRET")
+        self.mailbox = os.getenv("MS_SHARED_MAILBOX_KOCH")  # << Shared Mailbox UPN/SMTP
+        if not (self.tenant and self.client_id and self.client_secret and self.mailbox):
+            raise RuntimeError("Fehlende ENV Variablen: MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET, MS_SHARED_MAILBOX_KOCH")
+
+        self.app = ConfidentialClientApplication(
+            self.client_id,
+            authority=f"https://login.microsoftonline.com/{self.tenant}",
+            client_credential=self.client_secret
+        )
+
+    def _token(self) -> str:
+        res = self.app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+        if "access_token" not in res:
+            raise RuntimeError(f"Tokenfehler: {res.get('error_description')}")
+        return res["access_token"]
+
+    def _headers(self, prefer_text: bool = True) -> Dict[str, str]:
+        h = {"Authorization": f"Bearer {self._token()}"}
+        if prefer_text:
+            h["Prefer"] = 'outlook.body-content-type="text"'
+        return h
+
+    def list_sent_messages_top(self, top: int = 400) -> List[Dict[str, Any]]:
+        """
+        Holt die neuesten 'top' Nachrichten aus Gesendete Elemente.
+        """
+        url = f"{self.GRAPH_BASE}/users/{self.mailbox}/mailFolders/SentItems/messages"
+        params = {
+            "$top": str(max(1, min(int(top), 400))),
+            "$orderby": "receivedDateTime desc",
+            "$select": "id,subject,sentDateTime,receivedDateTime,toRecipients,ccRecipients,bccRecipients",
+        }
+        r = requests.get(url, headers=self._headers(), params=params, timeout=20)
+        r.raise_for_status()
+        return r.json().get("value", [])
+
+    def get_message_body(self, msg_id: str) -> Dict[str, Any]:
+        """
+        Holt Body als Text (per Prefer-Header), plus ein paar Metadaten.
+        """
+        url = f"{self.GRAPH_BASE}/users/{self.mailbox}/messages/{msg_id}"
+        params = {"$select": "id,subject,sentDateTime,receivedDateTime,body"}
+        r = requests.get(url, headers=self._headers(prefer_text=True), params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        body = (data.get("body") or {}).get("content", "") or ""
+        return {
+            "id": data.get("id"),
+            "subject": data.get("subject") or "",
+            "sentDateTime": data.get("sentDateTime"),
+            "receivedDateTime": data.get("receivedDateTime"),
+            "body": body,
+        }
+
+def _addresses(lst) -> List[str]:
+    out = []
+    for x in (lst or []):
+        ema = ((x.get("emailAddress") or {}).get("address") or "").strip().lower()
+        if ema:
+            out.append(ema)
+    return out
+
+@tool("finde_lieferung")
+def finde_lieferung(email: str) -> dict:
+    """
+    Durchsucht das **Shared Mailbox** 'Koch Alpin GmbH - Service' → Ordner **Gesendete Elemente** (SentItems),
+    max. die **400 neuesten** Mails, nach einer Mail, die an die gegebene **E-Mail-Adresse** gesendet wurde
+    (To/Cc/Bcc). Findet die Mail und extrahiert den **Sendungs-Status-Link** (post.at).
+
+    Input: email (str)
+    Output:
+      {
+        "email": "...",
+        "matched": true|false,
+        "message": {
+           "id": "...", "subject": "...",
+           "sentDateTime": "...", "receivedDateTime": "..."
+        } | null,
+        "status_link": "http://www.post.at/tnt_query.php?pnum1=...",  # wenn gefunden
+        "versand_ids": ["..."],  # falls extrahierbar
+        "checked_count": 123,
+        "note": "..."
+      }
+
+    Erfordert ENV: MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET, MS_SHARED_MAILBOX_KOCH
+    """
+    try:
+        client = _GraphKochClient()
+    except Exception as e:
+        return {"error": str(e), "email": email}
+
+    target = _normalize_email(email)
+    if not target:
+        return {"error": "Ungültige E-Mail-Adresse.", "email": email}
+
+    try:
+        msgs = client.list_sent_messages_top(top=400)
+    except Exception as e:
+        return {"error": f"Fehler beim Laden aus SentItems: {e}", "email": email}
+
+    matched_meta = None
+    for m in msgs:
+        to_l = _addresses(m.get("toRecipients"))
+        cc_l = _addresses(m.get("ccRecipients"))
+        bcc_l = _addresses(m.get("bccRecipients"))
+        all_rcpts = set(to_l + cc_l + bcc_l)
+        if target in all_rcpts:
+            matched_meta = m
+            break
+
+    if not matched_meta:
+        return {
+            "email": email, "matched": False, "message": None,
+            "status_link": None, "versand_ids": [],
+            "checked_count": len(msgs),
+            "note": "Keine passende gesendete Versandmail unter den neuesten 400 gefunden."
+        }
+
+    try:
+        full = client.get_message_body(matched_meta["id"])
+    except Exception as e:
+        return {"email": email, "matched": True, "message": matched_meta, "error": f"Body-Fehler: {e}"}
+
+    links, ids = _extract_tracking_links_from_html(full.get("body",""))
+    status_link = next((u for u in links if "post.at" in u), None)
+
+    return {
+        "email": email,
+        "matched": True,
+        "message": {
+            "id": full.get("id"),
+            "subject": full.get("subject"),
+            "sentDateTime": full.get("sentDateTime"),
+            "receivedDateTime": full.get("receivedDateTime"),
+        },
+        "status_link": status_link,
+        "versand_ids": ids,
+        "checked_count": len(msgs),
+        "note": "Erste passende Nachricht aus den neuesten 400 'Gesendete Elemente' ausgewertet."
+    }
+
+# =========================
 # ========= RAG ===========
 # =========================
 _EMBED_LOCAL_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -541,7 +741,7 @@ llm = ChatAnthropic(
     max_tokens=20000,
 )
 
-TOOLS = [wieder_verfuegbar, bedingungen, gear_guide, rag, search_web]
+TOOLS = [wieder_verfuegbar, bedingungen, gear_guide, rag, search_web, finde_lieferung]
 llm_with_tools = llm.bind_tools(TOOLS)
 
 class State(MessagesState):
@@ -627,15 +827,17 @@ graph_chat = graph
 if __name__ == "__main__":
     thread = {"configurable": {"thread_id": str(uuid.uuid4())}}
 
-    # Beispiel: explizit RAG nutzen
-    q1 = {
-        "role": "user",
-        "content": "Bitte nutze 'rag' und beantworte: Wie reklamiere ich defektes Zubehör?"
-    }
-    out1 = graph.invoke({"messages": [q1]}, config=thread)
-    print("ASSISTANT (RAG):", out1["messages"][-1].content[:1200] if out1["messages"] else "<no reply>")
+    # Beispiel: Tracking-Link suchen
+    q0 = {"role":"user","content":"finde_lieferung für max.mustermann@example.com"}
+    out0 = graph.invoke({"messages":[q0]}, config=thread)
+    print("ASSISTANT (finde_lieferung):", out0["messages"][-1].content[:800] if out0["messages"] else "<no reply>")
 
-    # Bestehende Tools funktionieren weiter
-    q2 = {"role":"user", "content":"Nutze 'bedingungen' und sag mir, wie der Versand läuft"}
+    # Beispiel: RAG
+    q1 = {"role":"user","content":"Bitte nutze 'rag' und beantworte: Wie reklamiere ich defektes Zubehör?"}
+    out1 = graph.invoke({"messages": [q1]}, config=thread)
+    print("ASSISTANT (RAG):", out1["messages"][-1].content[:800] if out1["messages"] else "<no reply>")
+
+    # Beispiel: Bedingungen
+    q2 = {"role":"user","content":"Nutze 'bedingungen' und sag mir, wie der Versand läuft"}
     out2 = graph.invoke({"messages":[q2]}, config=thread)
     print("ASSISTANT (Bedingungen):", out2["messages"][-1].content[:800] if out2["messages"] else "<no reply>")
