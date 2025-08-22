@@ -6,3 +6,23 @@ msal>=1.28.0
 requests>=2.32.0
 python-dotenv>=1.0.1
 beautifulsoup4>=4.12.3
+
+# Kern
+langgraph>=0.2.35
+langchain-anthropic>=0.2.0
+langchain-core>=0.3.0
+
+# HTTP/Parsing
+requests>=2.32.0
+beautifulsoup4>=4.12.3
+python-dotenv>=1.0.1
+
+# RAG / Suche
+chromadb==0.5.4
+sentence-transformers>=2.7.0
+rank-bm25>=0.2.2
+tavily-python>=0.4.0
+
+# optional nur falls du OpenAI-Embeddings nutzt
+openai>=1.40.0
+
