@@ -1,24 +1,37 @@
 from __future__ import annotations
 
-import uuid, os, re, json, datetime as dt
-from typing import Annotated, Literal, List, Dict, Any, Optional, Tuple
+# =========================
+# ===== Imports & Env =====
+# =========================
+import os, re, json, time, uuid, random, datetime as dt
+from typing import List, Dict, Any, Optional, Tuple
 from typing_extensions import TypedDict
 
 from dotenv import load_dotenv
 load_dotenv()
 
-from langchain_core.messages import AnyMessage, SystemMessage, HumanMessage, AIMessage, ToolMessage
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+
+# LangGraph / LangChain
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END, MessagesState
-from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.memory import InMemorySaver
 
-# LLM (Claude)
+# LLM (Anthropic)
 from langchain_anthropic import ChatAnthropic
 
-# --- RAG-Dependencies ---
+# MSAL (Microsoft Graph)
+try:
+    from msal import ConfidentialClientApplication
+except Exception:
+    ConfidentialClientApplication = None
+
+# --- RAG Dependencies ---
 import chromadb
 from chromadb.config import Settings
 try:
@@ -30,130 +43,116 @@ try:
 except Exception:
     BM25Okapi = None
 
-# --- HTTP / Parsing ---
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
 
-# --- Optional Tavily ---
+# =========================
+# ====== ENV & CONSTS =====
+# =========================
+TENANT_ID = os.getenv("MS_TENANT_ID")
+CLIENT_ID = os.getenv("MS_CLIENT_ID")
+CLIENT_SECRET = os.getenv("MS_CLIENT_SECRET")
+SHARED_MAILBOX = os.getenv("MS_SHARED_MAILBOX")  # z. B. "friends@zenbivy.eu"
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+# Optional zweite Shared Mailbox (für finde_lieferung / Koch Alpin)
+SHARED_MAILBOX_KOCH = os.getenv("MS_SHARED_MAILBOX_KOCH")
+
+# LLM-Config
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-7-sonnet-20250219")
+REQ_MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", "8000"))
+ANTHROPIC_OUTPUT_128K = os.getenv("ANTHROPIC_OUTPUT_128K", "0") == "1"
+ANTHROPIC_FALLBACK_MODEL = os.getenv("ANTHROPIC_FALLBACK_MODEL", "claude-3-5-sonnet-20241022")
+
+# Lookback für Autodraft
+LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "5"))
+
+# System Prompt
+SYSTEM = (
+    "Du bist sleepingbagREBEL, ein präziser, netter Mitarbeiter von Zenbivy. "
+    "Antworte in der Sprache der Eingabe, kurz und konkret. "
+    "Nutze nur die gelieferten Informationen bzw. Tools. "
+    "Wenn du unsicher bist, frage NICHT zurück, sondern liefere den besten Vorschlag. "
+)
+
+# Datenordner für wieder_verfuegbar
+_BASE_DIR = os.getenv("WIEDER_VERFUEGBAR_DIR", "")
+
+# Optional Tavily
 try:
     from tavily import TavilyClient
 except Exception:
     TavilyClient = None
 
-# --- MS Graph (für Outlook) ---
-try:
-    from msal import ConfidentialClientApplication
-except Exception:
-    ConfidentialClientApplication = None
+_USER_AGENT = "Mozilla/5.0 (compatible; ZenbivyAgent/1.0)"
+_HEADERS = {"User-Agent": _USER_AGENT}
+
 
 # =========================
-# ====== LLM & PROMPT =====
+# ======= Utilities =======
 # =========================
-MODEL = "claude-opus-4-1-20250805"  # ggf. anpassen (siehe Hinweis in der Chat-Nachricht)
+def _http_get(url: str, timeout: int = 20) -> str:
+    """Einfaches GET mit User-Agent und Fehlerhebung."""
+    resp = requests.get(url, timeout=timeout, headers={"User-Agent": _USER_AGENT})
+    resp.raise_for_status()
+    return resp.text
 
-SYSTEM = (
-    "Du bist sleepingbagREBEL, ein präziser, netter Mitarbeiter von Zenbivy. "
-    "Zeige nicht, dass du eine KI bist. "
-    "Antworte stets in der Sprache der Anfrage und in kompaktem Text. "
-    "Weise dezent auf den Newsletter hin (https://zenbivy.eu – rechts unten). "
-    "Für Bestelländerungen, Reklamationen oder Fälle für Menschen: bitte um E-Mail an friends@zenbivy.eu.\n"
-    "\n"
-    "Tool-Nutzung (proaktiv, lieber zu oft als zu selten):\n"
-    "• Für Größen, Anleitung, Füllgewicht, Zubehör: nutze 'gear_guide' (lädt Seiten & berücksichtigt Bilder via Alt-Text/Captions).\n"
-    "• Für Versand/Rückgabe/Rabatt: nutze 'bedingungen'.\n"
-    "• Für Verfügbarkeiten/Termine: nutze 'wieder_verfuegbar'.\n"
-    "• Für E-Mail-Antworten mit vorhandenen internen Infos: nutze 'rag' (Kontext holen, dann verallgemeinern, keine Namen/Datumsangaben übernehmen).\n"
-    "• Für Web-Recherche oder direkte URL-Inhalte: nutze 'search_web' (liefert Seiten-Text + Bild-Hinweise).\n"
-    "• Für Sendungs-Status-Links: nutze 'finde_lieferung' (sucht im Shared Mailbox die gesendete Versandmail und extrahiert den Tracking-Link).\n"
-    "\n"
-    "Wenn du Webseiten nutzt, integriere relevante Bildinformationen (Alt-Text, Bildunterschrift) inhaltlich in deine Antwort, aber füge keine großen HTML-Blöcke ein."
+def _is_retryable_error(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return any(k in s for k in [
+        "overloaded", "rate_limit", "timeout", "temporarily",
+        "unavailable", "gateway", "service unavailable",
+        "529", "429", "502", "503", "504"
+    ])
+
+def _invoke_with_retry(_llm, msgs, attempts: int = 6, base: float = 0.5, cap: float = 20.0):
+    for i in range(attempts):
+        try:
+            return _llm.invoke(msgs, config=RunnableConfig())
+        except Exception as e:
+            if i == attempts - 1 or not _is_retryable_error(e):
+                raise
+            sleep_s = min(cap, base * (2 ** i)) + random.uniform(0, 0.5)
+            time.sleep(sleep_s)
+
+def _try_invoke_with_fallback(msgs):
+    """Ruft LLM (mit Tools) robust auf, ggf. mit Fallback-Modell."""
+    try:
+        return _invoke_with_retry(llm_with_tools, msgs)
+    except Exception as e:
+        if _is_retryable_error(e):
+            alt_llm = ChatAnthropic(
+                model=ANTHROPIC_FALLBACK_MODEL,
+                api_key=ANTHROPIC_API_KEY,
+                temperature=0.2,
+                max_tokens=min(SAFE_MAX_TOKENS, 8000),
+            ).bind_tools(TOOLS)
+            return _invoke_with_retry(alt_llm, msgs)
+        raise
+
+
+# =========================
+# ========= LLM ===========
+# =========================
+_extra_headers = {}
+if ANTHROPIC_OUTPUT_128K:
+    # aktiviert 128k Output, wenn Account freigeschaltet
+    _extra_headers["anthropic-beta"] = "output-128k-2025-02-19"
+
+SAFE_MAX_TOKENS = REQ_MAX_TOKENS if ANTHROPIC_OUTPUT_128K else min(REQ_MAX_TOKENS, 8000)
+
+llm = ChatAnthropic(
+    model=ANTHROPIC_MODEL,
+    api_key=ANTHROPIC_API_KEY,
+    temperature=0.2,
+    max_tokens=SAFE_MAX_TOKENS,
+    extra_headers=_extra_headers or None,
 )
 
+
 # =========================
-# ====== PFAD/DATEIEN =====
+# ====== Web Sources ======
 # =========================
-_BASE_DIR = r"C:\Users\Fritz\Desktop\Python\sleepingbagREBEL_Infos\geschliffen"
-
-DateiAuswahl = Literal[
-    "Compression Caps",
-    "Core  Quilt Double  -4°C",
-    "Core Quilt -12°C",
-    "Core Quilt -4°C",
-    "Core Quilt -4°C Synthetic",
-    "Core Sheet Double -4°C",
-    "Core Sheet Down",
-    "Core Sheet Synthetic",
-    "Core Sheet Uninsulated",
-    "Coupon EUR 50",
-    "Ditty Dry Sack",
-    "Double Flex 3D Mattress",
-    "Double Luxe Sheet -4°C",
-    "Double Quilt -4°C",
-    "Down Pillow Topper",
-    "Dry Sack",
-    "Flex 3D Mattress",
-    "Flex Air Mattress",
-    "Flex Mattress",
-    "Inflation Dry Sack",
-    "Light Mattress",
-    "Light Quilt +4°C Synthetic",
-    "Light Quilt -12°C",
-    "Light Quilt -20°C",
-    "Light Quilt -4°C",
-    "Light Quilt 2025 +4°C Synthetic",
-    "Light Quilt 2025 -12°C",
-    "Light Quilt 2025 -4°C",
-    "Light Quilt Double  -4°C",
-    "Light Sheet -12°C",
-    "Light Sheet -20°C",
-    "Light Sheet -4°C",
-    "Light Sheet Double -4°C",
-    "Light Sheet Uninsulated",
-    "Mattress Repair Kit",
-    "Max Pump 2 Pro",
-    "Pillow Bladder",
-    "Pillowcase",
-    "Sonstiges",
-    "Titan Bivy Mug Lid",
-    "Ultralight Mattress",
-    "Ultralight Muscovy Quilt -12°C",
-    "Ultralight Muscovy Quilt -4°C",
-    "Ultralight Muscovy Sheet -12°C",
-    "Ultralight Muscovy Sheet -4°C",
-    "Ultralight Quilt -12°C",
-    "Ultralight Quilt -4°C",
-    "Ultralight Sheet -12°C",
-    "Ultralight Sheet -4°C",
-    "Ultralight Sheet Uninsulated",
-    "Zenbivy Bed -12°C",
-    "Zenbivy Bed -4°C",
-    "ZENBIVY VOUCHER",
-    "Zip Sack",
-    "Zipbed Overland -4°C Down",
-    "Zipbed Overland -4°C Synthetic",
-]
-
-PolicyKey = Literal[
-    "Rabattcode",
-    "Rückgabe- & Umtauschbedingungen",
-    "Versandbedingungen",
-]
-
-GuideKey = Literal[
-    "Baue dein Schlafsystem",
-    "Größentabelle",
-    "Gebrauchsanweisung",
-    "Füllgewicht",
-    "Besitzerhandbuch",
-    "Reparaturanleitung",
-    "Putzanleitung",
-    "Patents",
-    "Kontakt",
-    "Accessory Guide",
-    "Give Away",
-]
-
+GuideKey = str  # wir erlauben freie Strings + Mapping
 _SOURCES = {
     "Baue dein Schlafsystem": "https://zenbivy.eu/pages/build-your-sleeping-bag-system",
     "Größentabelle": "https://zenbivy.eu/pages/size-guide",
@@ -168,27 +167,14 @@ _SOURCES = {
     "Give Away": "https://zenbivy.eu/pages/giveaway",
 }
 
-_USER_AGENT = "Mozilla/5.0 (compatible; ZenbivyAgent/1.0)"
-_HEADERS = {"User-Agent": _USER_AGENT}
-
-# =========================
-# === TEXT + BILD PARSER ==
-# =========================
 def _extract_text_and_images(html: str, base_url: str):
-    """
-    Kompaktes Extrahieren von Text + bis zu 12 Bildern.
-    Berücksichtigt og:image & figcaption; dedupliziert Bilder.
-    Rückgabe: images = [{ "src", "alt" }, ...]
-    """
+    """Extrahiert knappen Text & bis zu 12 Bilder (Alt/Captions) aus HTML."""
     soup = BeautifulSoup(html, "html.parser")
-
-    # irrelevante Tags entfernen
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
 
     main = soup.find("main") or soup.find("article") or soup.body or soup
 
-    # sichtbaren Text
     parts = []
     for el in main.find_all(["h1","h2","h3","h4","h5","h6","p","li"], recursive=True):
         t = " ".join(el.get_text(" ", strip=True).split())
@@ -198,10 +184,9 @@ def _extract_text_and_images(html: str, base_url: str):
     if len(text) > 8000:
         text = text[:8000] + " … [gekürzt]"
 
-    # Bilder sammeln
     images: List[Dict[str, str]] = []
 
-    # 1) figure + figcaption
+    # figure + figcaption
     for fig in main.find_all("figure"):
         img = fig.find("img")
         if not img:
@@ -218,7 +203,7 @@ def _extract_text_and_images(html: str, base_url: str):
             alt = " ".join(cap_tag.get_text(" ", strip=True).split())
         images.append({"src": src, "alt": alt})
 
-    # 2) og:image / twitter:image (ergänzend)
+    # og:image / twitter:image
     for m in soup.find_all("meta"):
         prop = (m.get("property") or m.get("name") or "").lower()
         if prop in {"og:image", "twitter:image", "image"}:
@@ -228,7 +213,7 @@ def _extract_text_and_images(html: str, base_url: str):
                 if not src.lower().endswith(".svg"):
                     images.append({"src": src, "alt": ""})
 
-    # 3) generische <img>
+    # generische <img>
     for img in main.find_all("img"):
         src = img.get("src") or img.get("data-src") or img.get("data-original")
         if not src:
@@ -239,7 +224,7 @@ def _extract_text_and_images(html: str, base_url: str):
         alt = (img.get("alt") or img.get("title") or "").strip()
         images.append({"src": src, "alt": alt})
 
-    # Deduplizieren nach URL, triviale Assets ausfiltern
+    # deduplizieren
     blacklist = ("sprite", "icon", "logo", "placeholder", "tracking", "pixel", "badge", "spinner")
     seen = set()
     deduped = []
@@ -257,7 +242,11 @@ def _extract_text_and_images(html: str, base_url: str):
     title = soup.title.get_text(strip=True) if soup.title else ""
     return title, text, deduped
 
+def _looks_like_url(s: str) -> bool:
+    return bool(re.match(r"^https?://", s.strip(), flags=re.I))
+
 def _fetch_page(url: str) -> dict:
+    """Lädt eine Seite und extrahiert Text + Bilder (Alt/Captions)."""
     try:
         r = requests.get(url, timeout=20, headers=_HEADERS)
         r.raise_for_status()
@@ -266,24 +255,29 @@ def _fetch_page(url: str) -> dict:
     except Exception as e:
         return {"url": url, "error": f"Fehler beim Laden: {e}"}
 
-def _looks_like_url(s: str) -> bool:
-    return bool(re.match(r"^https?://", s.strip(), flags=re.I))
 
 # =========================
-# ======== TOOLS ==========
+# ========= TOOLS =========
 # =========================
 @tool("search_web")
-def search_web(
-    query: str,
-    max_results: int = 5,
-    restrict_to_zenbivy: bool = True,
-) -> dict:
+def search_web(query: str, max_results: int = 5, restrict_to_zenbivy: bool = True) -> dict:
     """
-    [Aktiv nutzen] Websuche via Tavily ODER Direkt-URL:
-      - Bei DIREKTER URL: lädt die Seite sofort und gibt Text + Bilder (Alt/Captions) zurück.
-      - Bei SUCHE: findet relevante Seiten (optional auf zenbivy.com/.eu beschränkt) und lädt jede Seite.
+    Websuche via Tavily ODER Direkt-URL:
+    - Wenn 'query' eine URL ist, wird die Seite sofort geladen und Text + Bilder zurückgegeben.
+    - Sonst: Suche über Tavily (falls installiert + API-Key), optional auf zenbivy.com/.eu beschränkt.
+    Rückgabe:
+      {
+        "query": str,
+        "restricted": bool,
+        "results": [
+          { "title": str, "url": str, "snippet": str, "score": float|None,
+            "page": {"url": str, "title": str, "text": str, "images":[{"src","alt"}]} | {"url": str, "error": str}
+          },
+          ...
+        ]
+      }
     """
-    # Direkter URL-Fetch ohne Suche
+    # Direkter URL-Fetch
     if _looks_like_url(query):
         page = _fetch_page(query.strip())
         return {
@@ -298,7 +292,7 @@ def search_web(
             }],
         }
 
-    # Tavily verfügbar?
+    # Tavily-Suche
     if TavilyClient is None:
         return {"query": query, "error": "tavily-python nicht installiert. Bitte 'pip install tavily-python'."}
 
@@ -338,103 +332,80 @@ def search_web(
         })
     return out
 
+
 @tool("gear_guide")
-def gear_guide(name: GuideKey) -> dict:
-    url = _SOURCES[name]
+def gear_guide(name: str) -> dict:
+    """
+    Lädt eine vordefinierte Zenbivy-Seite (Größe, Anleitung, Füllgewicht, Zubehör, Kontakt …)
+    anhand des Schlüssels 'name' (z. B. 'Größentabelle', 'Gebrauchsanweisung').
+    Rückgabe:
+      {
+        "source": str, "url": str, "title": str,
+        "text": str, "images": [{"src": str, "alt": str}]
+      }
+    """
+    # tolerantes Mapping
+    key = name.strip()
+    url = _SOURCES.get(key)
+    if not url:
+        # try case-insensitive / partial
+        for k, v in _SOURCES.items():
+            if k.lower() == key.lower():
+                url = v; key = k; break
+        if not url:
+            return {"source": key, "url": None, "error": f"Unbekannte Quelle: {name}"}
     try:
-        resp = requests.get(url, timeout=20, headers={"User-Agent": _USER_AGENT})
-        resp.raise_for_status()
+        html = _http_get(url)
     except Exception as e:
-        return {"source": name, "url": url, "error": f"Fehler beim Laden: {e}"}
-    title, text, images = _extract_text_and_images(resp.text, url)
-    return {"source": name, "url": url, "title": title, "text": text, "images": images}
+        return {"source": key, "url": url, "error": f"Fehler beim Laden: {e}"}
+    title, text, images = _extract_text_and_images(html, url)
+    return {"source": key, "url": url, "title": title, "text": text, "images": images}
+
 
 @tool("bedingungen")
-def bedingungen(kategorie: PolicyKey) -> str:
-    POLICIES = {
-        "Rückgabe- & Umtauschbedingungen": (
-            """             
-                Rückgabe- und Umtauschanweisungen
-                
-                Allgemeine Bedingungen:
-                - Rückgabe innerhalb von 14 Tagen nach Lieferung möglich
-                - Vollständige Rückerstattung des Kaufpreises inkl. ursprünglicher Versandkosten
-                - Größe und Komfort können zu Hause getestet werden
-                
-                Voraussetzungen für Rückgabe:
-                - Artikel muss unbenutzt sein
-                - In Originalverpackung zurücksenden (Ausnahme: Matten)
-                - Im gleichen Zustand wie bei Erhalt (inkl. aller Etiketten und Labels)
-                - Ausgefülltes Rücksendeformular beilegen
-                - Artikel dürfen nicht schmutzig oder mit Tierhaaren bedeckt sein
-                
-                Strafabzüge bei nicht ordnungsgemäßer Rückgabe:
-                - Fehlendes Etikett: 10€ Abzug
-                - Fehlendes eingenähtes Label (Law Tag): 50% Abzug
-                
-                Umtauschprozess:
-                1. Neue Bestellung für gewünschten Artikel aufgeben
-                2. Ursprünglichen Artikel zur Rückerstattung zurücksenden
-                Hinweis: Beide Bestellungen werden temporär belastet
-                
-                Bearbeitungszeiten:
-                - Rücksendebearbeitung: 3-6 Werktage (max. 2 Wochen)
-                - Rückerstattung: automatisch innerhalb 10 Werktagen auf ursprüngliche Zahlungsmethode
-                
-                Rücksendekosten und Verantwortung:
-                - Kunde trägt Rücksendekosten
-                - Empfehlung: Versand mit Sendungsverfolgung verwenden
-                - Zenbivy haftet nicht für verlorene oder beschädigte Pakete
-                - Keine Rücksendenummer ausstellbar
-                
-                Kontakt und Adresse:
-                - Kundenservice: friends@zenbivy.eu
-                - Rücksendeadresse: Koch alpin GmbH
-                                   Dr-Franz-Werner-Str.13
-                                   A-6020 Innsbruck
-                                   Tyrol, Austria, EU
-                """
-        ),
-        "Versandbedingungen": (
-            """
-            Versandbedingungen
-            
-            Lieferungen nach: Österreich, Belgien, Tschechien, Dänemark, Finnland, Frankreich, 
-            Deutschland, Irland, Italien, Niederlande, Polen, Portugal, Spanien, Schweden, 
-            Schweiz, Bulgarien, Kroatien, Zypern, Estland, Griechenland, Ungarn, Lettland, 
-            Litauen, Luxemburg, Malta, Rumänien, Slowakei, Slowenien - ausgenommen Überseegebiete.
-            
-            EU-Versand:
-            - Lieferung mit DPD
-            - Lieferzeit: 2 Tage (Österreich, Deutschland), bis zu 1 Woche (andere EU-Länder)
-            - Versandkosten: EUR 20,00 für Bestellungen bis EUR 300,00
-            - Kostenloser Versand für Bestellungen über EUR 300,00
-            - Ausnahme Zypern/Malta: Lieferung mit TNT für pauschal EUR 80,00
-            
-            Kleinbestellungen (bis EUR 150,00):
-            - Nach Deutschland und Österreich: nur EUR 6,00 Versandkosten
-            
-            Nicht-EU-Länder:
-            - Lieferung durch Post.at
-            - Lieferzeit: bis zu 1 Woche
-            - Preise ohne 20% Umsatzsteuer ausgewiesen
-            - Einfuhrumsatzsteuer und Zollgebühren bei Zustellung zu bezahlen
-            - Versandkosten:
-              * Schweiz: EUR 26,00
-              * UK, Island, Norwegen und andere Staaten: EUR 60,00
-            """
-        ),
-        "Rabattcode": "Man kann einen Rabattcode im Newsletter finden",
-    }
-    return POLICIES[kategorie]
+def bedingungen(kategorie: str) -> str:
+    """
+    Shop-Bedingungen kompakt. Eingabe: Kategorie-String, einer von:
+      - 'Rabattcode'
+      - 'Rückgabe- & Umtauschbedingungen'
+      - 'Versandbedingungen'
+    Rückgabe: Textblock mit den wichtigsten Infos.
+    """
+    k = kategorie.strip().lower()
+    if "rabatt" in k:
+        return (
+            "Rabatt: Newsletter-Rabatt des US-Shops gilt nicht automatisch für EU-Shop. "
+            "EU-Shop (zenbivy.eu) veröffentlicht Aktionen im Newsletter/Website."
+        )
+    if "rückgabe" in k or "umtausch" in k or "rueckgabe" in k:
+        return (
+            "Rückgabe/Umtausch: 14 Tage ab Lieferung. Artikel unbenutzt, in OVP, "
+            "im gleichen Zustand (inkl. Etiketten/Labels). Für Umtausch: neue Bestellung aufgeben, "
+            "Rückerstattung nach Eingang der Retoure. Rücksendekosten trägt Kunde. "
+            "Adresse: Koch Alpin GmbH, Dr.-Franz-Werner-Str. 13, A-6020 Innsbruck."
+        )
+    if "versand" in k:
+        return (
+            "Versand (EU): DPD, ca. 2 Tage (AT/DE) bis 1 Woche (andere EU). "
+            "Kosten: 20€ <= 300€, ab 300€ frei. Zypern/Malta pauschal 80€ (TNT). "
+            "Kleinbestellungen (<=150€) AT/DE: 6€. Nicht-EU: Post.at; Preise exkl. 20% USt.; "
+            "Einfuhrumsatzsteuer/Zoll bei Zustellung. Schweiz 26€, UK/Island/Norwegen 60€."
+        )
+    return "Unbekannte Kategorie. Verfügbar: Rabattcode | Rückgabe- & Umtauschbedingungen | Versandbedingungen."
+
 
 @tool("wieder_verfuegbar")
-def wieder_verfuegbar(datei: DateiAuswahl) -> str:
-    filename = f"{datei}.txt"
-    path = os.path.join(_BASE_DIR, filename)
+def wieder_verfuegbar(datei_oder_name: str) -> str:
+    """
+    Liest eine Textdatei (z. B. 'Light Quilt -4°C.txt') aus dem Ordner WIEDER_VERFUEGBAR_DIR (ENV)
+    und gibt deren Inhalt zurück. Eingabe: Dateiname ohne/mit .txt oder Produktbezeichnung.
+    """
+    s = datei_oder_name.strip()
+    fname = f"{s}.txt" if not s.lower().endswith(".txt") else s
+    path = os.path.join(_BASE_DIR, fname) if _BASE_DIR else fname
     if not os.path.isfile(path):
-        return f"[FEHLER] Datei nicht gefunden: {filename}"
-    for enc in ("utf-8-sig","utf-8","cp1252","latin-1"):
+        return f"[FEHLER] Datei nicht gefunden: {fname}"
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
         try:
             with open(path, "r", encoding=enc, errors="strict") as f:
                 return f.read()
@@ -443,13 +414,15 @@ def wieder_verfuegbar(datei: DateiAuswahl) -> str:
     with open(path, "rb") as f:
         return f.read().decode("utf-8", errors="ignore")
 
-# =========================
-# === MS GRAPH TOOL: finde_lieferung ===
-# =========================
+
 def _normalize_email(e: str) -> str:
     return (e or "").strip().lower()
 
 def _extract_tracking_links_from_html(html_or_text: str) -> Tuple[List[str], List[str]]:
+    """
+    Extrahiert Tracking-Links (post.at) und ggf. Versandeinheits-IDs (lange Ziffernfolgen).
+    Gibt (links, ids) zurück.
+    """
     content = html_or_text or ""
     try:
         soup = BeautifulSoup(content, "html.parser")
@@ -477,51 +450,101 @@ def _extract_tracking_links_from_html(html_or_text: str) -> Tuple[List[str], Lis
 
     return uniq_links, ids
 
-class _GraphKochClient:
-    GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-    def __init__(self):
-        if ConfidentialClientApplication is None:
-            raise RuntimeError("msal ist nicht installiert. Bitte 'pip install msal' und erneut versuchen.")
-        self.tenant = os.getenv("MS_TENANT_ID")
-        self.client_id = os.getenv("MS_CLIENT_ID")
-        self.client_secret = os.getenv("MS_CLIENT_SECRET")
-        self.mailbox = os.getenv("MS_SHARED_MAILBOX_KOCH")  # << Shared Mailbox UPN/SMTP
-        if not (self.tenant and self.client_id and self.client_secret and self.mailbox):
-            raise RuntimeError("Fehlende ENV Variablen: MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET, MS_SHARED_MAILBOX_KOCH")
 
+class _GraphClientBase:
+    def __init__(self, mailbox: str):
+        if ConfidentialClientApplication is None:
+            raise RuntimeError("msal ist nicht installiert. Bitte 'pip install msal'")
+        if not (TENANT_ID and CLIENT_ID and CLIENT_SECRET and mailbox):
+            raise RuntimeError("Fehlende ENV Variablen: MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET, MS_SHARED_MAILBOX*")
+        self.mailbox = mailbox
         self.app = ConfidentialClientApplication(
-            self.client_id,
-            authority=f"https://login.microsoftonline.com/{self.tenant}",
-            client_credential=self.client_secret
+            CLIENT_ID,
+            authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+            client_credential=CLIENT_SECRET
         )
 
-    def _token(self) -> str:
+    def token(self) -> str:
         res = self.app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
         if "access_token" not in res:
             raise RuntimeError(f"Tokenfehler: {res.get('error_description')}")
         return res["access_token"]
 
-    def _headers(self, prefer_text: bool = True) -> Dict[str, str]:
-        h = {"Authorization": f"Bearer {self._token()}"}
+    def _auth_headers(self, prefer_html: bool = False, prefer_text: bool = False) -> Dict[str, str]:
+        h = {"Authorization": f"Bearer {self.token()}"}
+        if prefer_html:
+            h["Prefer"] = 'outlook.body-content-type="html"'
         if prefer_text:
             h["Prefer"] = 'outlook.body-content-type="text"'
         return h
 
+
+class GraphClientInbox(_GraphClientBase):
+    """Client für Inbox (Autodraft)."""
+    def list_messages_since(self, since_iso: str, max_count: int = 50) -> List[Dict[str, Any]]:
+        params = {
+            "$top": str(max_count),
+            "$select": "id,receivedDateTime,subject,from",
+            "$orderby": "receivedDateTime desc",
+            "$filter": f"receivedDateTime ge {since_iso}",
+        }
+        url = f"{GRAPH_BASE}/users/{self.mailbox}/mailFolders/Inbox/messages"
+        r = requests.get(url, headers=self._auth_headers(), params=params, timeout=20)
+        r.raise_for_status()
+        return r.json().get("value", [])
+
+    def get_message_core(self, msg_id: str) -> Dict[str, Any]:
+        url = f"{GRAPH_BASE}/users/{self.mailbox}/messages/{msg_id}"
+        params = {"$select": "id,subject,from,sentDateTime,receivedDateTime,body"}
+        r = requests.get(url, headers=self._auth_headers(prefer_html=True), params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        body = (data.get("body") or {}) or {}
+        email = (data.get("from") or {}).get("emailAddress") or {}
+        return {
+            "id": data.get("id"),
+            "subject": data.get("subject") or "",
+            "from": email.get("name") or "",
+            "from_addr": email.get("address") or "",
+            "sentDateTime": data.get("sentDateTime"),
+            "receivedDateTime": data.get("receivedDateTime"),
+            "body_html": body.get("content", "") or "",
+        }
+
+    def create_reply_draft(self, original_id: str, html_body: str) -> str:
+        headers = self._auth_headers()
+        headers["Content-Type"] = "application/json"
+        # 1) Reply-Entwurf anlegen (Threading bleibt erhalten)
+        url_create = f"{GRAPH_BASE}/users/{self.mailbox}/messages/{original_id}/createReply"
+        r = requests.post(url_create, headers=headers, timeout=20)
+        r.raise_for_status()
+        draft = r.json()
+        draft_id = draft["id"]
+        # 2) Body als HTML setzen
+        url_patch = f"{GRAPH_BASE}/users/{self.mailbox}/messages/{draft_id}"
+        patch = {"body": {"contentType": "HTML", "content": html_body}}
+        r2 = requests.patch(url_patch, headers=headers, json=patch, timeout=20)
+        r2.raise_for_status()
+        return draft_id
+
+
+class GraphClientSent(_GraphClientBase):
+    """Client für 'Gesendete Elemente' (finde_lieferung)."""
     def list_sent_messages_top(self, top: int = 400) -> List[Dict[str, Any]]:
-        url = f"{self.GRAPH_BASE}/users/{self.mailbox}/mailFolders/SentItems/messages"
+        url = f"{GRAPH_BASE}/users/{self.mailbox}/mailFolders/SentItems/messages"
         params = {
             "$top": str(max(1, min(int(top), 400))),
             "$orderby": "receivedDateTime desc",
             "$select": "id,subject,sentDateTime,receivedDateTime,toRecipients,ccRecipients,bccRecipients",
         }
-        r = requests.get(url, headers=self._headers(), params=params, timeout=20)
+        r = requests.get(url, headers=self._auth_headers(), params=params, timeout=20)
         r.raise_for_status()
         return r.json().get("value", [])
 
     def get_message_body(self, msg_id: str) -> Dict[str, Any]:
-        url = f"{self.GRAPH_BASE}/users/{self.mailbox}/messages/{msg_id}"
+        url = f"{GRAPH_BASE}/users/{self.mailbox}/messages/{msg_id}"
         params = {"$select": "id,subject,sentDateTime,receivedDateTime,body"}
-        r = requests.get(url, headers=self._headers(prefer_text=True), params=params, timeout=20)
+        r = requests.get(url, headers=self._auth_headers(prefer_text=True), params=params, timeout=20)
         r.raise_for_status()
         data = r.json()
         body = (data.get("body") or {}).get("content", "") or ""
@@ -533,18 +556,24 @@ class _GraphKochClient:
             "body": body,
         }
 
-def _addresses(lst) -> List[str]:
-    out = []
-    for x in (lst or []):
-        ema = ((x.get("emailAddress") or {}).get("address") or "").strip().lower()
-        if ema:
-            out.append(ema)
-    return out
 
 @tool("finde_lieferung")
 def finde_lieferung(email: str) -> dict:
+    """
+    Durchsucht die Shared Mailbox (ENV: MS_SHARED_MAILBOX_KOCH) im Ordner 'Gesendete Elemente'
+    nach einer an 'email' adressierten Nachricht und extrahiert post.at-Trackinglinks.
+    Rückgabe:
+      {
+        "email": str, "matched": bool,
+        "message": {"id","subject","sentDateTime","receivedDateTime"}|None,
+        "status_link": str|None,
+        "versand_ids": [str],
+        "checked_count": int,
+        "note": str
+      }
+    """
     try:
-        client = _GraphKochClient()
+        client = GraphClientSent(SHARED_MAILBOX_KOCH or SHARED_MAILBOX or "")
     except Exception as e:
         return {"error": str(e), "email": email}
 
@@ -558,6 +587,14 @@ def finde_lieferung(email: str) -> dict:
         return {"error": f"Fehler beim Laden aus SentItems: {e}", "email": email}
 
     matched_meta = None
+    def _addresses(lst) -> List[str]:
+        out = []
+        for x in (lst or []):
+            ema = ((x.get("emailAddress") or {}).get("address") or "").strip().lower()
+            if ema:
+                out.append(ema)
+        return out
+
     for m in msgs:
         to_l = _addresses(m.get("toRecipients"))
         cc_l = _addresses(m.get("ccRecipients"))
@@ -597,10 +634,11 @@ def finde_lieferung(email: str) -> dict:
         "note": "Erste passende Nachricht aus den neuesten 400 'Gesendete Elemente' ausgewertet."
     }
 
+
 # =========================
-# ========= RAG ===========
+# ========== RAG ==========
 # =========================
-_EMBED_LOCAL_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+_EMBED_LOCAL_MODEL = os.getenv("RAG_LOCAL_EMBED", "sentence-transformers/all-MiniLM-L6-v2")
 
 class _LocalEmbedder:
     def __init__(self, model_name: str = _EMBED_LOCAL_MODEL):
@@ -651,18 +689,32 @@ def _build_context(docs: List[str], metas: List[Dict[str,Any]], max_chars: int =
 
 @tool("rag")
 def rag(query: str, top_k: int = 5) -> dict:
+    """
+    Durchsuche den Outlook-RAG-Index (Chroma) und liefere kompakten Kontext + Quellen.
+    Parameter:
+      - query: Suchfrage
+      - top_k: Anzahl der Snippets (Default 5)
+    Rückgabe:
+      { "context": str, "sources": [str], "items": [ {...} ] }
+    Erwartet ENV:
+      - CHROMA_PATH: Pfad zum Chroma-Index
+      - RAG_EMBEDDING: 'local' (default) oder 'openai'
+      - optional: BM25 Hybrid (rank_bm25 installiert)
+    """
     index_dir = os.getenv("CHROMA_PATH") or "./rag_index"
     client = chromadb.PersistentClient(path=index_dir, settings=Settings(allow_reset=False))
     coll = client.get_or_create_collection("outlook_rag")
     if coll.count() == 0:
         return {"error": f"Leerer Index unter {index_dir}. Bitte Index kopieren/erstellen."}
 
+    # Embedding-Provider
     emb_type = (os.getenv("RAG_EMBEDDING") or "local").lower()
     if emb_type == "openai":
         embedder = _OpenAIEmbedder(model=os.getenv("OPENAI_EMBED_MODEL","text-embedding-3-small"))
     else:
         embedder = _LocalEmbedder()
 
+    # 1) Vektor-Pool
     emb = embedder.embed([query])[0]
     pool_n = max(top_k, int(os.getenv("BM25_POOL", "20")))
     res = coll.query(query_embeddings=[emb], n_results=pool_n, include=["documents","metadatas","distances"])
@@ -670,6 +722,7 @@ def rag(query: str, top_k: int = 5) -> dict:
     metas = res.get("metadatas", [[]])[0]
     dists = res.get("distances", [[]])[0]
 
+    # 2) Hybrid-Rerank (optional)
     hybrid = (os.getenv("HYBRID", "true").lower() != "false") and (BM25Okapi is not None)
     alpha = float(os.getenv("HYBRID_ALPHA", "0.5"))
     if hybrid and docs:
@@ -677,6 +730,7 @@ def rag(query: str, top_k: int = 5) -> dict:
         bm25 = BM25Okapi(corpus_tokens)
         q_tokens = _tokenize([query])[0]
         bm_scores = bm25.get_scores(q_tokens)
+        # Distanz -> Similarität [0..1]
         if dists:
             max_d, min_d = max(dists), min(dists); rng = max(1e-9, max_d - min_d)
             vec_scores = [1.0 - ((d - min_d) / rng) for d in dists]
@@ -699,221 +753,21 @@ def rag(query: str, top_k: int = 5) -> dict:
     context, refs, items = _build_context(docs, metas, max_chars=12000)
     return {"context": context, "sources": refs, "items": items}
 
-# =========================
-# ======== LLM BIND =======
-# =========================
-llm = ChatAnthropic(
-    model=MODEL,
-    temperature=0,
-    max_tokens=50000,  # ggf. reduzieren (siehe Hinweis)
-)
 
+# =========================
+# ======== LLM Bind =======
+# =========================
 TOOLS = [wieder_verfuegbar, bedingungen, gear_guide, rag, search_web, finde_lieferung]
 _TOOL_MAP = {t.name: t for t in TOOLS}
 llm_with_tools = llm.bind_tools(TOOLS)
 
-class State(MessagesState):
-    pass
-
-# =========================
-# === Anthropic-Guards ====
-# =========================
-def _has_nonempty_content(msg) -> bool:
-    c = getattr(msg, "content", None)
-    if c is None:
-        return False
-    if isinstance(c, str):
-        return c.strip() != ""
-    if isinstance(c, list):
-        return len(c) > 0
-    return True
-
-def _normalized_msgs_for_anthropic(msgs, system_text: str):
-    if not msgs or (hasattr(msgs[0], "type") and msgs[0].type != "system"):
-        msgs = [SystemMessage(content=system_text)] + msgs
-
-    cleaned = []
-    for m in msgs:
-        if getattr(m, "type", None) in ("human", "ai", "system"):
-            if not _has_nonempty_content(m):
-                continue
-        cleaned.append(m)
-
-    if cleaned and cleaned[0].type == "system":
-        tail = cleaned[1:]
-    else:
-        tail = cleaned
-
-    if not tail:
-        return cleaned
-
-    if tail[0].type != "human":
-        return cleaned
-
-    return cleaned
-
-def agent_node(state: State, config: RunnableConfig):
-    msgs = state["messages"]
-    msgs = _normalized_msgs_for_anthropic(msgs, SYSTEM)
-
-    only_system = len(msgs) == 1 and msgs[0].type == "system"
-    first_is_human = (len(msgs) > 1 and msgs[0].type == "system" and msgs[1].type == "human") or (len(msgs) > 0 and msgs[0].type == "human")
-
-    if only_system or not first_is_human:
-        return {"messages": []}
-
-    ai = llm_with_tools.invoke(msgs, config=config)
-    return {"messages": [ai]}
-
-tool_node = ToolNode(TOOLS)
-
-builder_chat = StateGraph(State)
-builder_chat.add_node("agent", agent_node)
-builder_chat.add_node("tools", tool_node)
-
-builder_chat.add_edge(START, "agent")
-builder_chat.add_conditional_edges("agent", tools_condition)
-builder_chat.add_edge("tools", "agent")
-
-checkpointer = InMemorySaver()
-graph_chat = builder_chat.compile(checkpointer=checkpointer)
-
-# =====================================================================
-# ============ OUTLOOK AUTODRAFT (Entwürfe im Thread speichern) =======
-# =====================================================================
-
-GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-TENANT_ID = os.getenv("MS_TENANT_ID")
-CLIENT_ID = os.getenv("MS_CLIENT_ID")
-CLIENT_SECRET = os.getenv("MS_CLIENT_SECRET")
-SHARED_MAILBOX = os.getenv("MS_SHARED_MAILBOX")
-LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "5"))
-
-def _ensure(val: Optional[str], name: str):
-    if not val:
-        raise RuntimeError(f"ENV {name} fehlt.")
-
-class GraphClient:
-    def __init__(self):
-        if ConfidentialClientApplication is None:
-            raise RuntimeError("msal ist nicht installiert. Bitte 'pip install msal'")
-        _ensure(TENANT_ID, "MS_TENANT_ID")
-        _ensure(CLIENT_ID, "MS_CLIENT_ID")
-        _ensure(CLIENT_SECRET, "MS_CLIENT_SECRET")
-        _ensure(SHARED_MAILBOX, "MS_SHARED_MAILBOX")
-        self.app = ConfidentialClientApplication(
-            CLIENT_ID,
-            authority=f"https://login.microsoftonline.com/{TENANT_ID}",
-            client_credential=CLIENT_SECRET
-        )
-
-    def token(self) -> str:
-        res = self.app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
-        if "access_token" not in res:
-            raise RuntimeError(f"Tokenfehler: {res.get('error_description')}")
-        return res["access_token"]
-
-    def _auth_headers(self, prefer_html: bool = False) -> Dict[str, str]:
-        h = {"Authorization": f"Bearer {self.token()}"}
-        if prefer_html:
-            h["Prefer"] = 'outlook.body-content-type="html"'
-        return h
-
-    def list_messages_since(self, since_iso: str, max_count: int = 50) -> List[Dict[str, Any]]:
-        params = {
-            "$top": str(max_count),
-            "$select": "id,receivedDateTime,subject,from",
-            "$orderby": "receivedDateTime desc",
-            "$filter": f"receivedDateTime ge {since_iso}",
-        }
-        url = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/mailFolders/Inbox/messages"
-        r = requests.get(url, headers=self._auth_headers(), params=params, timeout=20)
-        r.raise_for_status()
-        return r.json().get("value", [])
-
-    def get_message_core(self, msg_id: str) -> Dict[str, Any]:
-        url = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{msg_id}"
-        params = {"$select": "id,subject,from,sentDateTime,receivedDateTime,body"}
-        r = requests.get(url, headers=self._auth_headers(prefer_html=True), params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        body = (data.get("body") or {}) or {}
-        email = (data.get("from") or {}).get("emailAddress") or {}
-        return {
-            "id": data.get("id"),
-            "subject": data.get("subject") or "",
-            "from": email.get("name") or "",
-            "from_addr": email.get("address") or "",
-            "sentDateTime": data.get("sentDateTime"),
-            "receivedDateTime": data.get("receivedDateTime"),
-            "body_html": body.get("content", "") or "",
-        }
-
-    def create_reply_draft(self, original_id: str, html_body: str) -> str:
-        headers = self._auth_headers()
-        headers["Content-Type"] = "application/json"
-        url_create = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{original_id}/createReply"
-        r = requests.post(url_create, headers=headers, timeout=20)
-        r.raise_for_status()
-        draft = r.json()
-        draft_id = draft["id"]
-
-        url_patch = f"{GRAPH_BASE}/users/{SHARED_MAILBOX}/messages/{draft_id}"
-        patch = {"body": {"contentType": "HTML", "content": html_body}}
-        r2 = requests.patch(url_patch, headers=headers, json=patch, timeout=20)
-        r2.raise_for_status()
-        return draft_id
-
-def utc_iso_now_minus_minutes(minutes: int) -> str:
-    return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-def _format_dt_for_quote(iso: Optional[str]) -> str:
-    if not iso:
-        return ""
-    try:
-        d = dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(dt.timezone(dt.timedelta(hours=0)))
-        return d.strftime("%Y-%m-%d %H:%M UTC")
-    except Exception:
-        return iso or ""
-
-def build_reply_with_history(reply_html: str, original_html: str, from_name: str = "", sent_iso: str = "", subject: str = "") -> str:
-    when = _format_dt_for_quote(sent_iso)
-    header_line = ""
-    if when or from_name or subject:
-        header_line = (
-            f'<div style="margin-top:16px;margin-bottom:8px;font-size:12px;color:#555;">'
-            f'----- Original Message -----<br>'
-            f'Von: {from_name or "Unbekannt"}<br>'
-            f'Gesendet: {when or "Unbekannt"}<br>'
-            f'Betreff: {subject or "(kein Betreff)"}'
-            f'</div>'
-        )
-    quoted = (
-        '<blockquote style="margin:0;padding-left:.8em;border-left:2px solid #ccc;">'
-        f'{original_html}'
-        '</blockquote>'
-    )
-    return f'{reply_html}<br><br>{header_line}{quoted}'
-
-def sanitize_llm_html(s: str) -> str:
-    t = (s or "").strip()
-    # Codefences entfernen
-    if t.startswith("```"):
-        t = t.strip("`").strip()
-        # evtl. führendes "html" entfernen
-        if t.lower().startswith("html"):
-            t = t[4:].lstrip()
-    return t
-
-def _invoke_llm_with_tools(msgs: List[Any]) -> AIMessage:
-    # Einfache direkte Nutzung (du kannst hier bei Bedarf Retry/Fallback ergänzen)
-    return llm_with_tools.invoke(msgs, config=RunnableConfig())
-
 def run_agent_with_tools(user_text: str) -> str:
+    """
+    Einfache Tool-Schleife: bis zu 3 Tool-Runden, danach Rückgabe der Modellantwort.
+    """
     msgs: List[Any] = [SystemMessage(content=SYSTEM), HumanMessage(content=user_text)]
-    # bis zu 3 Tool-Runden
     for _ in range(3):
-        ai: AIMessage = _invoke_llm_with_tools(msgs)
+        ai: AIMessage = _try_invoke_with_fallback(msgs)
         msgs.append(ai)
         tool_calls = getattr(ai, "tool_calls", None) or []
         if not tool_calls:
@@ -933,7 +787,60 @@ def run_agent_with_tools(user_text: str) -> str:
                                     name=name, tool_call_id=call.get("id")))
     return "Ich konnte die Anfrage nicht abschließen. Bitte schreibe an friends@zenbivy.eu."
 
-# ---- Autodraft-State & Nodes ----
+
+# =========================
+# ===== Autodraft Util ====
+# =========================
+def utc_iso_now_minus_minutes(minutes: int) -> str:
+    """UTC-ISO8601 Zeit mit Z, z. B. '2025-08-21T09:10:00Z'."""
+    return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _format_dt_for_quote(iso: Optional[str]) -> str:
+    """Formatiert ISO-Datum für Quote-Header."""
+    if not iso: return ""
+    try:
+        d = dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(dt.timezone(dt.timedelta(hours=0)))
+        return d.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return iso or ""
+
+def build_reply_with_history(reply_html: str, original_html: str, from_name: str = "", sent_iso: str = "", subject: str = "") -> str:
+    """
+    Baut finalen Antwort-HTML-Body:
+    - oben: KI-Antwort
+    - darunter: Quote-Header + Original in <blockquote>
+    """
+    when = _format_dt_for_quote(sent_iso)
+    header_line = ""
+    if when or from_name or subject:
+        header_line = (
+            f'<div style="margin-top:16px;margin-bottom:8px;font-size:12px;color:#555;">'
+            f'----- Original Message -----<br>'
+            f'Von: {from_name or "Unbekannt"}<br>'
+            f'Gesendet: {when or "Unbekannt"}<br>'
+            f'Betreff: {subject or "(kein Betreff)"}'
+            f'</div>'
+        )
+    quoted = (
+        '<blockquote style="margin:0;padding-left:.8em;border-left:2px solid #ccc;">'
+        f'{original_html}'
+        '</blockquote>'
+    )
+    return f'{reply_html}<br><br>{header_line}{quoted}'
+
+def sanitize_llm_html(s: str) -> str:
+    """Entfernt Codefences, leading 'html' etc., falls das Modell versehentlich formatiert."""
+    t = (s or "").strip()
+    if t.startswith("```"):
+        t = t.strip("`").strip()
+        if t.lower().startswith("html"):
+            t = t[4:].lstrip()
+    return t
+
+
+# =========================
+# ====== AUTODRAFT SG =====
+# =========================
 class AutoDraftState(TypedDict, total=False):
     messages: List[Any]
     lookback_iso: str
@@ -942,23 +849,37 @@ class AutoDraftState(TypedDict, total=False):
     drafted_ids: List[str]
 
 def node_fetch_recent_emails(state: AutoDraftState) -> AutoDraftState:
-    client = GraphClient()
+    """
+    Holt E-Mails der letzten LOOKBACK_MINUTES Minuten (Basisdaten).
+    """
+    client = GraphClientInbox(SHARED_MAILBOX or "")
     since_iso = utc_iso_now_minus_minutes(LOOKBACK_MINUTES)
     msgs = client.list_messages_since(since_iso=since_iso, max_count=50)
     return {"lookback_iso": since_iso, "new_emails": msgs}
 
 def node_generate_drafts_body_only(state: AutoDraftState) -> AutoDraftState:
-    client = GraphClient()
+    """
+    Für jede neue Nachricht:
+    - Original (Body+Metadaten) laden
+    - KI-Antwort als HTML generieren (basierend auf Body)
+    - Antwort + zitiertes Original kombinieren
+    - createReply + PATCH (Body) -> Draft speichern (bleibt im Thread)
+    """
+    client = GraphClientInbox(SHARED_MAILBOX or "")
     drafted = 0
     draft_ids: List[str] = []
+
     for m in state.get("new_emails", []):
         msg_id = m["id"]
+
+        # 1) Original inkl. HTML-Body, From, Betreff, Datum
         core = client.get_message_core(msg_id)
         body_html = core["body_html"] or "<div>(Kein Inhalt erkannt)</div>"
         from_name = core["from"]
         sent_iso = core["sentDateTime"]
         subject = core["subject"]
 
+        # 2) LLM mit E-Mail-Body füttern (Antwort-Body zurückgeben)
         user_text = (
             "Erstelle eine höfliche, hilfreiche und konkrete Antwort als HTML und unterschreibe mit 'sleepingbagREBEL'. "
             "Antworte ausschließlich basierend auf folgendem E-Mail-Body. "
@@ -968,6 +889,7 @@ def node_generate_drafts_body_only(state: AutoDraftState) -> AutoDraftState:
             f"{body_html}\n"
             "EMAIL_BODY_HTML_END"
         )
+
         reply_html_raw = run_agent_with_tools(user_text)
         reply_html = sanitize_llm_html(reply_html_raw) or (
             "<p>Vielen Dank für Ihre Nachricht! "
@@ -975,6 +897,7 @@ def node_generate_drafts_body_only(state: AutoDraftState) -> AutoDraftState:
             "<p>Beste Grüße<br>sleepingbagREBEL</p>"
         )
 
+        # 3) Antwort + zitiertes Original kombinieren (wie Outlook)
         combined_html = build_reply_with_history(
             reply_html=reply_html,
             original_html=body_html,
@@ -982,6 +905,8 @@ def node_generate_drafts_body_only(state: AutoDraftState) -> AutoDraftState:
             sent_iso=sent_iso,
             subject=subject,
         )
+
+        # 4) Draft im Thread erstellen (createReply) & Body patchen
         try:
             draft_id = client.create_reply_draft(original_id=msg_id, html_body=combined_html)
             drafted += 1
@@ -1005,7 +930,7 @@ def node_summarize(state: AutoDraftState) -> AutoDraftState:
     text = "\n".join(summary_lines)
     return {"messages": [AIMessage(content=text)]}
 
-# Graph bauen (Autodraft)
+# Autodraft-Graph bauen
 builder_autodraft = StateGraph(AutoDraftState)
 builder_autodraft.add_node("fetch_recent_emails", node_fetch_recent_emails)
 builder_autodraft.add_node("generate_drafts_body_only", node_generate_drafts_body_only)
@@ -1018,19 +943,61 @@ builder_autodraft.add_edge("summarize", END)
 
 graph_autodraft = builder_autodraft.compile()
 
+
 # =========================
-# ===== Export Auswahl ====
+# ====== CHAT GRAPH =======
+# =========================
+def call_model(state: MessagesState) -> Dict[str, Any]:
+    """
+    Fügt den System-Prompt voran und ruft das Modell (mit Tools) auf.
+    """
+    msgs = [SystemMessage(content=SYSTEM)] + state["messages"]
+    ai = _try_invoke_with_fallback(msgs)
+    return {"messages": [ai]}
+
+tool_node = ToolNode(TOOLS)
+
+builder_chat = StateGraph(MessagesState)
+builder_chat.add_node("call_model", call_model)
+builder_chat.add_node("tools", tool_node)
+
+builder_chat.add_edge(START, "call_model")
+builder_chat.add_conditional_edges(
+    "call_model",
+    tools_condition,
+    {
+        "tools": "tools",
+        END: END,
+    },
+)
+builder_chat.add_edge("tools", "call_model")
+
+checkpointer = InMemorySaver()
+graph_chat = builder_chat.compile(checkpointer=checkpointer)
+
+
+# =========================
+# ===== Default-Export ====
 # =========================
 _DEFAULT = (os.getenv("DEFAULT_GRAPH") or "chat").lower().strip()
 graph = graph_autodraft if _DEFAULT == "autodraft" else graph_chat
 
-if __name__ == "__main__":
-    # Beispiel: Chat
-    thread = {"configurable": {"thread_id": str(uuid.uuid4())}}
-    q = {"role":"user","content":"Nutze 'bedingungen' und sag mir, wie der Versand läuft"}
-    out = graph_chat.invoke({"messages":[q]}, config=thread)
-    print("ASSISTANT (Chat):", out["messages"][-1].content[:500] if out.get("messages") else "<no reply>")
 
-    # Beispiel: Autodraft (ruft Inbox der letzten LOOKBACK_MINUTES Minuten ab und erstellt Antwort-Entwürfe)
-    out2 = graph_autodraft.invoke({})
-    print("AUTODRAFT:", out2.get("messages",[AIMessage(content='<no summary>')])[-1].content)
+# =========================
+# ======== __main__ =======
+# =========================
+if __name__ == "__main__":
+    # Kleiner Smoke-Test (lokal)
+    thread = {"configurable": {"thread_id": str(uuid.uuid4())}}
+
+    # Chat-Test
+    q = {"role": "user", "content": "Nutze 'bedingungen' und sag mir kurz, wie der Versand läuft."}
+    out = graph_chat.invoke({"messages": [q]}, config=thread)
+    print("CHAT:", out["messages"][-1].content[:500] if out.get("messages") else "<no reply>")
+
+    # Autodraft-Test (führt Knoten der letzten LOOKBACK_MINUTES aus)
+    try:
+        out2 = graph_autodraft.invoke({})
+        print("AUTODRAFT:", out2.get("messages", [AIMessage(content="<no summary>")])[-1].content)
+    except Exception as e:
+        print("AUTODRAFT FEHLER:", e)
