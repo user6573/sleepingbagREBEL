@@ -808,17 +808,8 @@ llm = ChatAnthropic(
 TOOLS = [wieder_verfuegbar, bedingungen, gear_guide, rag, search_web, finde_lieferung]
 llm_with_tools = llm.bind_tools(TOOLS)
 
-# alt
-# from langgraph.graph import StateGraph, START, END, MessagesState
-from langgraph.graph import StateGraph, START, END
-from typing_extensions import TypedDict
-from typing import List
-from langchain_core.messages import AnyMessage
-from langgraph.graph.message import add_messages
-
-class State(TypedDict):
-    messages: Annotated[List[AnyMessage], add_messages]
-
+class State(MessagesState):
+    pass
 
 # =========================
 # === Anthropic-Guards ====
@@ -914,4 +905,3 @@ if __name__ == "__main__":
     q2 = {"role":"user","content":"Nutze 'bedingungen' und sag mir, wie der Versand läuft"}
     out2 = graph.invoke({"messages":[q2]}, config=thread)
     print("ASSISTANT (Bedingungen):", out2["messages"][-1].content[:800] if out2["messages"] else "<no reply>")
-
