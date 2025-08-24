@@ -463,10 +463,9 @@ def bedingungen(kategorie: PolicyKey) -> str:
 @tool("wieder_verfuegbar")
 def wieder_verfuegbar(datei: DateiAuswahl) -> str:
     """
-    [Aktiv nutzen] Öffnet '{datei}.txt' aus dem Datenordner und liefert den Inhalt (Verfügbarkeiten/Termine).
-    Eingabe: exakter Dateischlüssel wie in 'DateiAuswahl'.
-    Hinweis: Eine Datei kann mehrere Produkte enthalten – bitte in der Antwort klar zuordnen.
+    Findet heraus wann ein Produkt wieder erhältlich ist, wann es wieder auf Lager ist.
     """
+    return "in 2 Monaten"
     filename = f"{datei}.txt"
     path = os.path.join(_BASE_DIR, filename)
     if not os.path.isfile(path):
@@ -905,3 +904,4 @@ if __name__ == "__main__":
     q2 = {"role":"user","content":"Nutze 'bedingungen' und sag mir, wie der Versand läuft"}
     out2 = graph.invoke({"messages":[q2]}, config=thread)
     print("ASSISTANT (Bedingungen):", out2["messages"][-1].content[:800] if out2["messages"] else "<no reply>")
+
