@@ -802,6 +802,8 @@ llm = ChatAnthropic(
     model=MODEL,
     temperature=0,
     max_tokens=30000,
+    timeout=50,                       # großzügiger Timeout
+    max_retries=10,  
 )
 
 TOOLS = [wieder_verfuegbar, bedingungen, gear_guide, rag, search_web, finde_lieferung]
@@ -904,4 +906,5 @@ if __name__ == "__main__":
     q2 = {"role":"user","content":"Nutze 'bedingungen' und sag mir, wie der Versand läuft"}
     out2 = graph.invoke({"messages":[q2]}, config=thread)
     print("ASSISTANT (Bedingungen):", out2["messages"][-1].content[:800] if out2["messages"] else "<no reply>")
+
 
