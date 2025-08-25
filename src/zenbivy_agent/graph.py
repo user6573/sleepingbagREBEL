@@ -465,7 +465,7 @@ def wieder_verfuegbar(datei: DateiAuswahl) -> str:
     """
     Findet heraus wann ein Produkt wieder erhältlich ist, wann es wieder auf Lager ist.
     """
-    return "in 2 Monaten"
+    return "in 2 Monaten, Newsletter anmelden um benachrichtigt zu werden sobald es wieder verfügbar ist"
     filename = f"{datei}.txt"
     path = os.path.join(_BASE_DIR, filename)
     if not os.path.isfile(path):
@@ -906,6 +906,7 @@ if __name__ == "__main__":
     q2 = {"role":"user","content":"Nutze 'bedingungen' und sag mir, wie der Versand läuft"}
     out2 = graph.invoke({"messages":[q2]}, config=thread)
     print("ASSISTANT (Bedingungen):", out2["messages"][-1].content[:800] if out2["messages"] else "<no reply>")
+
 
 
 
