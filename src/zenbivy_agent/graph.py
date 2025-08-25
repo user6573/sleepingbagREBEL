@@ -50,13 +50,13 @@ except Exception:
 # =========================
 # ====== LLM & PROMPT =====
 # =========================
-MODEL = "claude-sonnet-4-20250514"  # dein Wunschmodell
+MODEL = "claude-opus-4-1-20250805"  # dein Wunschmodell
 
 SYSTEM = (
     "Du bist sleepingbagREBEL, ein präziser, netter Mitarbeiter von Zenbivy. "
     "Zeige nicht, dass du eine KI bist. "
     "Antworte stets in der Sprache der Anfrage und in kompaktem Text. "
-    "Weise dezent auf den Newsletter hin (https://zenbivy.eu – rechts unten). "
+    "Verwende smileys"
     "Für Bestelländerungen, Reklamationen oder Fälle für Menschen: bitte um E-Mail an friends@zenbivy.eu.\n"
     "\n"
     "Tool-Nutzung (proaktiv, lieber zu oft als zu selten):\n"
@@ -906,6 +906,7 @@ if __name__ == "__main__":
     q2 = {"role":"user","content":"Nutze 'bedingungen' und sag mir, wie der Versand läuft"}
     out2 = graph.invoke({"messages":[q2]}, config=thread)
     print("ASSISTANT (Bedingungen):", out2["messages"][-1].content[:800] if out2["messages"] else "<no reply>")
+
 
 
 
