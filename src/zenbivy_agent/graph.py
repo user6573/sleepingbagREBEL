@@ -50,7 +50,7 @@ except Exception:
 # =========================
 # ====== LLM & PROMPT =====
 # =========================
-MODEL = "claude-3-5-sonnet-20241022"  # dein Wunschmodell
+MODEL = "claude-3-7-sonnet-20250219"  # dein Wunschmodell
 
 SYSTEM = (
     "Du bist sleepingbagREBEL, ein präziser, netter Mitarbeiter von Zenbivy. "
@@ -801,7 +801,7 @@ def rag(query: str, top_k: int = 5) -> dict:
 llm = ChatAnthropic(
     model=MODEL,
     temperature=0,
-    max_tokens=8000,
+    max_tokens=20000,
     timeout=1000,                       # großzügiger Timeout
     max_retries=50,  
 )
@@ -906,6 +906,7 @@ if __name__ == "__main__":
     q2 = {"role":"user","content":"Nutze 'bedingungen' und sag mir, wie der Versand läuft"}
     out2 = graph.invoke({"messages":[q2]}, config=thread)
     print("ASSISTANT (Bedingungen):", out2["messages"][-1].content[:800] if out2["messages"] else "<no reply>")
+
 
 
 
